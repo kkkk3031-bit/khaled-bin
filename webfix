@@ -10,7 +10,7 @@ echo "=== $(date '+%F %T') webfix run ===" >> "$LOG"
 ~/bin/webcheck > "$CACHE/last.log" 2>&1
 
 DOWN=$(comm -12 <(sort "$CACHE/baseline.txt") \
-                <(awk -F'\t' '$1 !~ /^[23]/ {print $4}' "$CACHE/results.txt" | sort))
+                <(awk -F'\t' '$5=="down" {print $4}' "$CACHE/results.txt" | sort))
 
 if [ -z "$DOWN" ]; then
   echo "all baseline apps UP" >> "$LOG"

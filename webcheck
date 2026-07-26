@@ -55,15 +55,32 @@ echo "Testing all URLs..."
   echo "$plat|$name|$dom"
 done | xargs -P 30 -I{} bash -c '
   IFS="|" read -r plat name dom <<< "{}"
-  code=$(curl -s -o /dev/null -w "%{http_code}" -m 12 "https://$dom/")
-  printf "%s\t%s\t%s\t%s\n" "$code" "$plat" "$name" "$dom"
+  body=$(mktemp)
+  code=$(curl -s -o "$body" -w "%{http_code}" -m 20 "https://$dom/")
+  # A platform placeholder means nothing was ever deployed there — that is PARKED,
+  # not an outage. Anything else non-2xx/3xx is a real failure worth waking webfix.
+  #   railway "Application not found" = no service | "failed to respond" = crashed
+  #   vercel  DEPLOYMENT_NOT_FOUND    = no deploy  | NOT_FOUND = deployed, no route at /
+  state=up
+  case "$code" in
+    2*|3*) ;;
+    *) if head -c 400 "$body" | grep -qE "Application not found|DEPLOYMENT_NOT_FOUND"; then
+         state=parked
+       else state=down; fi ;;
+  esac
+  rm -f "$body"
+  printf "%s\t%s\t%s\t%s\t%s\n" "$code" "$plat" "$name" "$dom" "$state"
 ' | sort > "$CACHE/results.txt"
 
 echo
 echo "=== ✅ WORKING (2xx/3xx) ==="
-awk -F'\t' '$1 ~ /^[23]/ {printf "%-4s %-8s %-28s https://%s\n",$1,$2,$3,$4}' "$CACHE/results.txt"
+awk -F'\t' '$5=="up" {printf "%-4s %-8s %-28s https://%s\n",$1,$2,$3,$4}' "$CACHE/results.txt"
 echo
-echo "=== ❌ DOWN (4xx/5xx/000) ==="
-awk -F'\t' '$1 !~ /^[23]/ {printf "%-4s %-8s %-28s https://%s\n",$1,$2,$3,$4}' "$CACHE/results.txt"
+echo "=== ❌ DOWN (should be up, is not) ==="
+awk -F'\t' '$5=="down" {printf "%-4s %-8s %-28s https://%s\n",$1,$2,$3,$4}' "$CACHE/results.txt"
 echo
-awk -F'\t' 'BEGIN{u=0;d=0} $1~/^[23]/{u++} $1!~/^[23]/{d++} END{print "TOTAL: "u" working, "d" down"}' "$CACHE/results.txt"
+echo "=== 💤 PARKED (nothing deployed — not an outage) ==="
+awk -F'\t' '$5=="parked" {printf "%-4s %-8s %-28s https://%s\n",$1,$2,$3,$4}' "$CACHE/results.txt"
+echo
+awk -F'\t' 'BEGIN{u=0;d=0;p=0} $5=="up"{u++} $5=="down"{d++} $5=="parked"{p++}
+  END{print "TOTAL: "u" working, "d" down, "p" parked"}' "$CACHE/results.txt"
