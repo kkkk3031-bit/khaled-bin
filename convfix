@@ -1,0 +1,64 @@
+#!/bin/bash
+# convfix — deep converter health: run a REAL tiny conversion on the Railway
+# converters (yt-mp3 + tweetget). "Up" is not enough — the 2026-07-10/11
+# outages returned 200 on / while every job died "All sources are busy".
+# Failing service → railway up --detach from its repo → re-probe → if still
+# broken, escalate to headless Claude. Cooldown so we never redeploy-loop.
+# Cron: */30. Log: ~/.cache/convfix.log
+export PATH="$HOME/bin:$HOME/.local/bin:$HOME/.railway/bin:/usr/local/bin:/usr/bin:/bin"
+LOG=~/.cache/convfix.log
+LOCK=/tmp/convfix.lock
+COOLDOWN=~/.cache/convfix-last-redeploy
+exec 9>"$LOCK"; flock -n 9 || exit 0
+
+YT=https://youtube-mp3-downloader-production-c1e2.up.railway.app
+TG=https://tweetget-production.up.railway.app
+YT_LINK="https://youtu.be/jNQXAC9IVRw"                      # Me at the zoo, 19s
+TG_LINK="https://x.com/SpaceX/status/1732824684683784516"   # known video tweet
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+# probe <base-url> <json-body> [max-polls] → 0 ok, 1 broken
+probe() {
+  local base=$1 body=$2 polls=${3:-50} j id st err
+  j=$(curl -s -m 20 -X POST "$base/start" -H "Content-Type: application/json" -d "$body")
+  id=$(echo "$j" | python3 -c "import json,sys;print(json.load(sys.stdin).get('job_id',''))" 2>/dev/null)
+  [ -z "$id" ] && { log "PROBE $base: no job_id ($j)"; return 1; }
+  for _ in $(seq 1 "$polls"); do
+    sleep 5
+    j=$(curl -s -m 10 "$base/status/$id")
+    st=$(echo "$j" | python3 -c "import json,sys;print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+    [ "$st" = done ] && return 0
+    if [ "$st" = error ]; then
+      err=$(echo "$j" | python3 -c "import json,sys;print(json.load(sys.stdin).get('error',''))" 2>/dev/null)
+      log "PROBE $base: job error: $err"
+      return 1
+    fi
+  done
+  log "PROBE $base: timed out ($j)"
+  return 1
+}
+
+# heal <name> <repo-dir> <base-url> <json-body>
+heal() {
+  local name=$1 repo=$2 base=$3 body=$4 now last
+  now=$(date +%s); last=$(cat "$COOLDOWN.$name" 2>/dev/null || echo 0)
+  if [ $((now - last)) -lt 7200 ]; then
+    log "$name still broken but redeployed <2h ago — escalating to Claude"
+    claude -p --dangerously-skip-permissions "The $name Railway converter at $base is failing real conversions (jobs end in error like 'All sources are busy') and a plain redeploy within the last 2h did not fix it. Repo: $repo. Read 'railway logs' after 'railway link' there, diagnose (usual causes: stale yt-dlp → bump/reinstall yt-dlp@master and rebuild bgutil PO-token provider; dead proxy list; upstream API change), fix the code, 'railway up --detach', then verify by POSTing $body to $base/start and polling /status until done. Keep commands short-timeout. Log what you did." >> "$LOG" 2>&1
+    return
+  fi
+  log "$name broken → railway up from $repo"
+  (cd "$repo" && railway up --detach >> "$LOG" 2>&1)
+  echo "$now" > "$COOLDOWN.$name"
+  sleep 150
+  if probe "$base" "$body" 60; then log "$name FIXED by redeploy"; else log "$name STILL BROKEN after redeploy (next run escalates)"; fi
+}
+
+if probe "$YT" "{\"url\":\"$YT_LINK\",\"format\":\"mp3\",\"quality\":\"320K\"}"; then log "yt-mp3 OK"
+else heal yt-mp3 ~/ytmp3 "$YT" "{\"url\":\"$YT_LINK\",\"format\":\"mp3\",\"quality\":\"320K\"}"; fi
+
+if probe "$TG" "{\"url\":\"$TG_LINK\",\"format\":\"mp4\"}"; then log "tweetget OK"
+else heal tweetget ~/tweetget "$TG" "{\"url\":\"$TG_LINK\",\"format\":\"mp4\"}"; fi
+
+log "run done"

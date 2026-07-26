@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# autorun — run every automation on this VPS now, instead of waiting for cron.
+#
+#   autorun            run the fast loops now (push/deploy, KDL release, MCP, URLs)
+#   autorun --all      also run the AI loops (webfix, convfix, logwatch, KDL probe, vault)
+#   autorun --status   what every loop is, when it last ran, and its last line
+#   autorun <name>     just that one
+#   autorun --list     the registry
+#
+# Each job already guards itself (flock / its own hash / its own strikes), so
+# running one by hand can never collide with its cron tick — worst case it exits
+# saying there was nothing to do.
+set -u
+LOG=$HOME/.cache/autorun.log
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+
+#      name|command|log file|stale after (min, 0 = never)|tier
+JOBS='
+autopush|/home/khaled/bin/autopush|/home/khaled/.cache/autopush.log|0|fast
+kdl-release|/home/khaled/bin/kdl-release|/home/khaled/.cache/kdl-release.log|0|fast
+mcpfix|/home/khaled/bin/mcpfix|/home/khaled/.cache/mcpfix.log|45|fast
+webcheck|/home/khaled/bin/webcheck|/home/khaled/.cache/webcheck/results.txt|0|fast
+kdl-autoupdate|/home/khaled/bin/kdl-autoupdate|/home/khaled/.cache/kdl-autoupdate.log|420|ai
+webfix|/home/khaled/bin/webfix|/home/khaled/.cache/webcheck/webfix.log|90|ai
+convfix|/home/khaled/bin/convfix|/home/khaled/.cache/convfix.log|45|ai
+logwatch-ai|/home/khaled/bin/logwatch-ai|/home/khaled/.cache/logwatch/logwatch.log|25|ai
+vault-agent|/home/khaled/bin/vault-agent|/home/khaled/vault/Logs/agent-log.md|0|ai
+'
+
+rows() { echo "$JOBS" | grep -v '^$'; }
+field() { echo "$1" | cut -d'|' -f"$2"; }
+
+ago() {  # human "how long since this file changed"
+  local f=$1 m
+  [ -e "$f" ] || { echo "never"; return; }
+  m=$(( ($(date +%s) - $(stat -c %Y "$f")) / 60 ))
+  if   [ "$m" -lt 60 ]   ; then echo "${m}m ago"
+  elif [ "$m" -lt 1440 ] ; then echo "$((m/60))h ago"
+  else echo "$((m/1440))d ago"; fi
+}
+
+status() {
+  printf "%-15s %-12s %-10s %-7s %s\n" JOB SCHEDULE "LAST RUN" STATE "LAST LINE"
+  while read -r r; do
+    [ -z "$r" ] && continue
+    local n c l max sched state age m
+    n=$(field "$r" 1); c=$(field "$r" 2); l=$(field "$r" 3); max=$(field "$r" 4)
+    # match by basename — crontab lines use both /home/khaled/bin/x and $HOME/bin/x
+    sched=$(crontab -l 2>/dev/null | grep -v '^#' | grep -F "bin/$(basename "$c")" | awk '{print $1" "$2}' | head -1)
+    [ -z "$sched" ] && sched="(no cron)"
+    state=ok
+    if [ ! -e "$l" ]; then state="—"
+    elif [ "$max" != 0 ]; then
+      m=$(( ($(date +%s) - $(stat -c %Y "$l")) / 60 ))
+      [ "$m" -gt "$max" ] && state=STALE
+    fi
+    age=$(ago "$l")
+    printf "%-15s %-12s %-10s %-7s %s\n" "$n" "$sched" "$age" "$state" \
+      "$(tail -1 "$l" 2>/dev/null | cut -c1-70)"
+  done <<< "$(rows)"
+}
+
+run_one() {  # name|cmd|... -> writes result line to $TMP
+  local r=$1 n c s e rc
+  n=$(field "$r" 1); c=$(field "$r" 2)
+  [ -x "$c" ] || { echo "$n|missing|0" > "$TMP/$n"; return; }
+  s=$(date +%s)
+  timeout 900 "$c" > "$TMP/$n.out" 2>&1; rc=$?
+  e=$(( $(date +%s) - s ))
+  case $rc in
+    0)   echo "$n|ok|$e" ;;
+    124) echo "$n|timeout|$e" ;;
+    *)   echo "$n|fail($rc)|$e" ;;
+  esac > "$TMP/$n"
+}
+
+case "${1:-}" in
+  --status) status; exit 0 ;;
+  --list)   rows | awk -F'|' '{printf "%-15s %-4s %s\n",$1,$5,$2}'; exit 0 ;;
+  --all)    SET=$(rows) ;;
+  "")       SET=$(rows | grep '|fast$') ;;
+  -*)       echo "unknown flag: $1"; exit 2 ;;
+  *)        SET=$(rows | grep "^$1|") ; [ -z "$SET" ] && { echo "no such job: $1"; exit 2; } ;;
+esac
+
+n=$(echo "$SET" | grep -c .)
+echo "running $n job(s)…"
+while read -r r; do [ -n "$r" ] && run_one "$r" & done <<< "$SET"
+wait
+
+printf "\n%-15s %-10s %s\n" JOB RESULT TIME
+fails=0
+while read -r r; do
+  [ -z "$r" ] && continue
+  name=$(field "$r" 1)
+  IFS='|' read -r _ res secs < "$TMP/$name"
+  printf "%-15s %-10s %ss\n" "$name" "$res" "$secs"
+  [ "$res" = ok ] || fails=$((fails + 1))
+  echo "$(date '+%F %T') $name $res ${secs}s" >> "$LOG"
+done <<< "$SET"
+
+if [ "$fails" -gt 0 ]; then
+  echo
+  echo "$fails job(s) not ok — output kept per job:"
+  while read -r r; do
+    [ -z "$r" ] && continue
+    name=$(field "$r" 1)
+    grep -q "|ok|" "$TMP/$name" || { echo "--- $name"; tail -6 "$TMP/$name.out" 2>/dev/null; }
+  done <<< "$SET"
+fi
+exit 0

@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# gh-connect — put a project folder on GitHub, safely, in one command.
+#
+#   gh-connect --all        every project folder in ~ that has no git remote
+#   gh-connect <dir> ...    just these
+#   gh-connect --dry-run …  show what would happen, touch nothing
+#
+# git init -> .gitignore (deps, logs, builds, secrets) -> SECRET SCAN -> private
+# repo via gh -> push. Once connected, ~/bin/autopush keeps it pushed every 20m.
+#
+# The secret scan is a hard gate: if a staged file looks like it carries a key,
+# nothing is created and nothing is pushed. Fix the ignore, then re-run.
+set -u
+DRY=0; ALL=0; TARGETS=()
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY=1 ;;
+    --all)     ALL=1 ;;
+    -*)        echo "unknown flag: $a"; exit 2 ;;
+    *)         TARGETS+=("$a") ;;
+  esac
+done
+
+# Folders that are not projects, or must never leave this box.
+NOPE='android-sdk|gradle-.*|opt|__blobstorage__|azurite-data|snap|go|bin|clones|node_modules|Downloads|Desktop|Documents|Pictures|Videos|Music|Public|Templates'
+
+if [ "$ALL" = 1 ]; then
+  cd "$HOME" || exit 1
+  for d in */; do
+    n=${d%/}
+    [[ "$n" =~ ^($NOPE)$ ]] && continue
+    [ -d "$n/.git" ] && [ -n "$(git -C "$n" remote 2>/dev/null)" ] && continue
+    # only things that look like code
+    find "$n" -maxdepth 2 \( -name package.json -o -name '*.py' -o -name '*.sh' \
+      -o -name build.gradle -o -name Dockerfile -o -name '*.js' -o -name '*.tsx' \
+      -o -name '*.toml' -o -name '*.md' \) -print -quit 2>/dev/null | grep -q . \
+      && TARGETS+=("$HOME/$n")
+  done
+fi
+[ ${#TARGETS[@]} -eq 0 ] && { echo "nothing to connect"; exit 0; }
+
+IGNORE='node_modules/
+.next/
+dist/
+build/
+venv/
+__pycache__/
+*.log
+*.log.*
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.keystore
+cookies.txt
+keys.env
+backups/
+*.tar.gz
+*.zip
+.DS_Store
+.vercel/
+.railway/'
+
+# Patterns that mean "this file is carrying a credential".
+SECRETS='AuthKey *= *"[A-Za-z0-9_-]{8}|sk-[A-Za-z0-9]{20}|ghp_[A-Za-z0-9]{20}|github_pat_|AIza[A-Za-z0-9_-]{20}|BEGIN [A-Z ]*PRIVATE KEY|xox[baprs]-|password *= *["'"'"'][^"'"'"']{6}'
+
+for dir in "${TARGETS[@]}"; do
+  dir=${dir%/}; [ -d "$dir" ] || { echo "skip $dir (not a directory)"; continue; }
+  name=$(basename "$dir")
+  echo "── $name"
+
+  if [ -d "$dir/.git" ] && [ -n "$(git -C "$dir" remote 2>/dev/null)" ]; then
+    echo "   already connected: $(git -C "$dir" remote get-url origin)"; continue
+  fi
+
+  if [ "$DRY" = 0 ]; then
+    [ -d "$dir/.git" ] || git -C "$dir" init -q -b main
+    # merge our ignores into whatever is already there
+    touch "$dir/.gitignore"
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      grep -qxF "$line" "$dir/.gitignore" || echo "$line" >> "$dir/.gitignore"
+    done <<< "$IGNORE"
+    git -C "$dir" add -A >/dev/null 2>&1
+  fi
+
+  # What would ship: the staged set for real runs, the un-ignored working tree
+  # for --dry-run (nothing is staged there, and a dry run must still be able to
+  # see a secret — that is the whole point of running it first).
+  if [ "$DRY" = 1 ]; then
+    files=$(cd "$dir" && find . -type f \
+      -not -path './node_modules/*' -not -path './.git/*' -not -path './venv/*' \
+      -not -path './.next/*' -not -path './dist/*' -not -path './build/*' \
+      -not -name '*.log' -not -name '.env*' -not -name '*.key' -not -name '*.keystore' \
+      2>/dev/null | sed 's|^\./||')
+  else
+    files=$(git -C "$dir" diff --cached --name-only 2>/dev/null)
+  fi
+  staged=$(echo "$files" | grep -c .)
+
+  # --- secret gate -------------------------------------------------------
+  hits=$(echo "$files" | while read -r f; do
+           [ -n "$f" ] && [ -f "$dir/$f" ] || continue
+           grep -lEI "$SECRETS" "$dir/$f" 2>/dev/null
+         done)
+  if [ -n "$hits" ]; then
+    echo "   ❌ possible secret in: $(echo "$hits" | paste -sd', ')"
+    echo "      nothing created. Add it to .gitignore (git rm --cached it) and re-run."
+    [ "$DRY" = 0 ] && git -C "$dir" reset -q
+    continue
+  fi
+
+  if [ "$DRY" = 1 ]; then
+    echo "   would create private repo '$name' and push $staged file(s)"; continue
+  fi
+
+  git -C "$dir" commit -qm "initial commit — connected by gh-connect" >/dev/null 2>&1
+  if gh repo create "$name" --private --source="$dir" --remote=origin --push >/dev/null 2>&1; then
+    echo "   ✅ $(git -C "$dir" remote get-url origin) — $staged file(s) pushed"
+  else
+    echo "   ❌ gh repo create failed (name taken? try: gh repo create $name-vps …)"
+  fi
+done

@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Release the KDL app automatically whenever its code changed.
+#
+#   kdl-release            build + publish only if app sources changed
+#   kdl-release --force    build + publish no matter what
+#   kdl-release --status   what would happen, without doing it
+#
+# Run by cron; also fine to run by hand. One release per code change:
+#   sources changed → bump versionCode → build.sh (which TESTS, then publishes)
+#   → commit + push → record the new source hash.
+#
+# build.sh is the gate: backend paths + a real emulator e2e must pass or nothing
+# is published and the previous APK stays live. This script never bypasses it.
+set -u
+APP=$HOME/kdl-app
+LOG=$HOME/.cache/kdl-release.log
+HASHFILE=$HOME/.cache/kdl-release.hash
+LOCK=$HOME/.cache/kdl-release.lock
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+# Everything that ends up inside the APK. build.sh/test scripts are deliberately
+# excluded — changing a test must not mint a new version for users.
+srchash() {
+  find "$APP/app/src" "$APP/app/build.gradle" -type f 2>/dev/null \
+    | sort | xargs sha1sum 2>/dev/null | sha1sum | cut -d' ' -f1
+}
+
+FORCE=0
+case "${1:-}" in
+  --force) FORCE=1 ;;
+  --status)
+    echo "current: $(grep -oP 'versionCode \K\d+' "$APP/app/build.gradle" | head -1) / live: $(cat "$HOME/twitter-dl/public/kdl-version.json")"
+    [ "$(srchash)" = "$(cat "$HASHFILE" 2>/dev/null)" ] \
+      && echo "sources unchanged — nothing to release" || echo "sources CHANGED — a release is due"
+    exit 0 ;;
+esac
+
+# A build takes ~15 min (emulator has no KVM). Never start a second one on top.
+exec 9>"$LOCK"
+flock -n 9 || { log "another release is still running — skipped"; exit 0; }
+
+NOW=$(srchash)
+if [ "$FORCE" = 0 ] && [ "$NOW" = "$(cat "$HASHFILE" 2>/dev/null)" ]; then
+  exit 0
+fi
+
+cd "$APP" || exit 1
+VC=$(grep -oP 'versionCode \K\d+' app/build.gradle | head -1)
+OLDVN=$(grep -oP 'versionName "\K[^"]+' app/build.gradle)
+NEW=$((VC + 1))
+# versionName and the KDL #N hashtag both follow versionCode, so they can never
+# disagree with what is actually installed: 26 → v3.3 → #1, 27 → v3.4 → #2 …
+NEWVN="3.$((NEW - 23))"
+NEWNO=$((NEW - 25))
+
+sed -i -E "s/versionCode $VC/versionCode $NEW/; s/versionName \"[^\"]+\"/versionName \"$NEWVN\"/; s/\\\$\{[0-9]+ - 25\}/\${$NEW - 25}/" app/build.gradle
+
+log "releasing v$NEWVN ($NEW) = KDL #$NEWNO"
+if ./build.sh >> "$LOG" 2>&1; then
+  # Hash the tree AS BUILT — the bump itself changed build.gradle, so storing
+  # the pre-bump hash made every later run see "sources changed" and release an
+  # identical build every 30 min (it did exactly that once: #3 for no reason).
+  srchash > "$HASHFILE"
+  git add -A >/dev/null 2>&1
+  git commit -qm "v$NEWVN (vc$NEW) — KDL #$NEWNO, auto-released" >/dev/null 2>&1
+  git push -q origin HEAD >/dev/null 2>&1 && log "pushed to github" || log "git push failed (build still published)"
+  log "✅ published v$NEWVN ($NEW) — phones update themselves on next start"
+else
+  # Put the version back: nothing was published under $NEW, so the retry should
+  # reuse that number instead of burning one per failed attempt. The hash is not
+  # stored either, so the next tick tries again.
+  sed -i -E "s/versionCode $NEW/versionCode $VC/; s/versionName \"$NEWVN\"/versionName \"$OLDVN\"/; s/\\\$\{$NEW - 25\}/\${$VC - 25}/" app/build.gradle
+  log "❌ build/tests FAILED — nothing published, previous APK still live (version rolled back to $VC)"
+  exit 1
+fi

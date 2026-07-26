@@ -1,0 +1,115 @@
+#!/bin/bash
+# kdl-autoupdate — keeps the KDL app and everything it downloads from working,
+# by itself. Three jobs, in order:
+#   1. yt-dlp freshness — TikTok/Instagram/X extraction is the first thing to
+#      rot when a site changes; grab the latest release, verify it runs and can
+#      still resolve a real TikTok, and roll back if it can't.
+#   2. real download probe — one REAL file from each of the 4 sites (X, TikTok,
+#      Instagram, YouTube). "Server is up" proved worthless twice before.
+#   3. publish chain — live kdl.apk md5 == the built APK, and kdl-version.json's
+#      versionCode == build.gradle's, so the in-app 12h update check can never
+#      point at a stale or missing APK. Drift is re-published automatically.
+# Two consecutive failures of the same probe → headless Claude diagnose+fix.
+# Cron: 20 */6 * * *   Log: ~/.cache/kdl-autoupdate.log
+export PATH="$HOME/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+LOG=~/.cache/kdl-autoupdate.log
+STATE=~/.cache/kdl-autoupdate.fails
+exec 9>/tmp/kdl-autoupdate.lock; flock -n 9 || exit 0
+
+TW=http://127.0.0.1:4310
+APP=~/kdl-app
+PUB=~/twitter-dl/public
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+FAILED=""
+
+# ---------- 1. yt-dlp self-update (guarded) ----------
+CUR=$(yt-dlp --version 2>/dev/null)
+curl -sL -m 120 -o "$TMP/yt-dlp" https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp
+if [ -s "$TMP/yt-dlp" ]; then
+  chmod +x "$TMP/yt-dlp"
+  NEW=$("$TMP/yt-dlp" --version 2>/dev/null)
+  if [ -n "$NEW" ] && [ "$NEW" != "$CUR" ]; then
+    # Prove the new build still extracts before trusting it with live traffic.
+    if timeout 120 "$TMP/yt-dlp" -g --no-warnings "https://www.tiktok.com/@tiktok/video/7665823355194363167" >/dev/null 2>&1; then
+      cp ~/bin/yt-dlp ~/bin/yt-dlp.prev 2>/dev/null
+      cp "$TMP/yt-dlp" ~/bin/yt-dlp && log "yt-dlp updated $CUR -> $NEW (extraction verified)"
+      pkill -f "node server.js" >/dev/null 2>&1 && sleep 1
+      (cd ~/twitter-dl && setsid nohup node server.js >> server.log 2>&1 < /dev/null &)
+      sleep 3
+    else
+      log "yt-dlp $NEW REJECTED — could not extract a known TikTok; staying on $CUR"
+    fi
+  fi
+fi
+
+# ---------- 2. one real download per site ----------
+enc() { python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$1"; }
+ismp4() { [ "$(stat -c%s "$1" 2>/dev/null || echo 0)" -gt 40000 ] && file -b "$1" | grep -qiE "ISO Media|MP4"; }
+
+probe_site() { # label url-to-fetch
+  curl -s -m 240 -o "$TMP/p.mp4" "$2"
+  if ismp4 "$TMP/p.mp4"; then
+    log "OK $1 ($(stat -c%s "$TMP/p.mp4") bytes)"
+  else
+    log "FAIL $1 :: $(head -c 140 "$TMP/p.mp4" | tr -d '\n')"
+    FAILED="$FAILED $1"
+  fi
+}
+probe_site x         "$TW/api/video?url=$(enc 'https://x.com/SpaceX/status/1732824684683784516')"
+probe_site tiktok    "$TW/api/tiktok?url=$(enc 'https://www.tiktok.com/@tiktok/video/7665823355194363167')"
+probe_site instagram "$TW/api/instagram?url=$(enc 'https://www.instagram.com/reel/DMmxU4bKcsR/')"
+
+# YouTube goes through the Railway converter; convfix already redeploys it, so
+# here we only need to know whether the app's MP3 button would work right now.
+if curl -s -m 300 -o "$TMP/p.mp3" "$TW/api/mp3?url=https://youtu.be/jNQXAC9IVRw" \
+   && [ "$(stat -c%s "$TMP/p.mp3" 2>/dev/null || echo 0)" -gt 40000 ] \
+   && file -b "$TMP/p.mp3" | grep -qiE "Audio|MPEG|ID3"; then
+  log "OK youtube ($(stat -c%s "$TMP/p.mp3") bytes)"
+else
+  log "FAIL youtube :: $(head -c 140 "$TMP/p.mp3" 2>/dev/null | tr -d '\n')"
+  FAILED="$FAILED youtube"
+fi
+
+# ---------- 3. publish chain ----------
+BUILT=$(ls -t "$APP"/app/build/outputs/apk/release/*.apk 2>/dev/null | head -1)
+VC=$(grep -oP 'versionCode\s+\K[0-9]+' "$APP/app/build.gradle")
+VN=$(grep -oP 'versionName\s+"\K[^"]+' "$APP/app/build.gradle")
+LIVE_VC=$(python3 -c "import json;print(json.load(open('$PUB/kdl-version.json'))['versionCode'])" 2>/dev/null)
+if [ -n "$BUILT" ]; then
+  if [ "$(md5sum "$BUILT" | cut -d' ' -f1)" != "$(md5sum "$PUB/kdl.apk" 2>/dev/null | cut -d' ' -f1)" ]; then
+    # Only republish something that is actually signed with Khaled's keystore.
+    if apksigner verify --print-certs "$BUILT" 2>/dev/null | grep -q "CN=Khaled"; then
+      cp "$BUILT" "$PUB/kdl.apk" && log "REPUBLISHED apk (live copy differed from build) vc=$VC"
+    else
+      log "apk drift but built APK is not signed CN=Khaled — left live copy alone"
+      FAILED="$FAILED apk-signature"
+    fi
+  fi
+fi
+if [ "$LIVE_VC" != "$VC" ]; then
+  printf '{"versionCode": %s, "versionName": "%s", "url": "http://72.60.89.132:4310/kdl.apk", "date": "%s"}\n' \
+    "$VC" "$VN" "$(date +%F)" > "$PUB/kdl-version.json"
+  log "version.json synced $LIVE_VC -> $VC ($VN)"
+fi
+curl -s -m 15 -o /dev/null -w '' "$TW/kdl.apk" || FAILED="$FAILED apk-url"
+HC=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$TW/kdl.apk")
+[ "$HC" = 200 ] || { log "FAIL kdl.apk download URL -> $HC"; FAILED="$FAILED apk-url"; }
+
+# ---------- escalation: same probe failing twice in a row ----------
+PREV=$(cat "$STATE" 2>/dev/null)
+echo "$FAILED" > "$STATE"
+if [ -n "$FAILED" ]; then
+  REPEAT=""
+  for f in $FAILED; do echo "$PREV" | grep -qw "$f" && REPEAT="$REPEAT $f"; done
+  if [ -n "$REPEAT" ]; then
+    log "ESCALATING to Claude — persistent:$REPEAT"
+    claude -p "KDL app auto-check: these download paths failed twice in a row:$REPEAT.
+Server is ~/twitter-dl/server.js on port 4310 (endpoints /api/video /api/tiktok /api/instagram /api/mp3), app is ~/kdl-app.
+Read ~/.cache/kdl-autoupdate.log and ~/twitter-dl/server.log, diagnose the real cause, fix it, restart the server with setsid nohup, and verify with a real download that produces genuine MP4/MP3 bytes. Do not report success without a verified file." \
+      --permission-mode bypassPermissions >> "$LOG" 2>&1
+    log "escalation finished"
+  fi
+else
+  log "all green (vc$VC $VN)"
+fi

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# council "<question>"  — ask every AI that has a key, print all answers.
+# council --save "<question>"  — also append the round-table to the vault Wiki.
+set -uo pipefail
+KEYS="$HOME/.config/ai-council/keys.env"
+[ -f "$KEYS" ] && set -a && . "$KEYS" && set +a
+
+save=0; [ "${1:-}" = "--save" ] && { save=1; shift; }
+q="$*"; [ -z "$q" ] && { echo 'usage: council [--save] "question"'; exit 2; }
+
+declare -A KEYMAP=( [gemini]="${GEMINI_API_KEY:-}" [openai]="${OPENAI_API_KEY:-}" [deepseek]="${DEEPSEEK_API_KEY:-}" [kimi]="${MOONSHOT_API_KEY:-}" [minimax]="${MINIMAX_API_KEY:-}" )
+out="# Council: $q\n\n_$(date -u +'%F %H:%M UTC')_\n"
+any=0
+for a in gemini openai deepseek kimi minimax; do
+  [ -z "${KEYMAP[$a]}" ] && continue
+  any=1
+  echo "── $a ──"
+  ans=$("$HOME/bin/ask" "$a" "$q" 2>&1)
+  echo "$ans"; echo
+  out="$out\n## $a\n$ans\n"
+done
+[ "$any" = 0 ] && echo "No AI keys set yet. Add at least one to $KEYS" && exit 3
+if [ "$save" = 1 ]; then
+  f="$HOME/vault/Wiki/Council-$(date -u +%Y%m%d-%H%M).md"
+  echo -e "$out" > "$f"; echo "saved → $f"
+  ~/bin/vault-sync "council: $q" >/dev/null 2>&1 || true
+fi

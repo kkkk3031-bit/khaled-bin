@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# ask <agent> "<prompt>"  — send a prompt to one AI, print its reply.
+# Agents: gemini | codex | openai | deepseek | kimi | minimax
+# Keys come from ~/.config/ai-council/keys.env. All use OpenAI-compatible chat.
+set -uo pipefail
+KEYS="$HOME/.config/ai-council/keys.env"
+[ -f "$KEYS" ] && set -a && . "$KEYS" && set +a
+
+agent="${1:-}"; shift || true
+prompt="$*"
+[ -z "$agent" ] || [ -z "$prompt" ] && { echo "usage: ask <gemini|codex|openai|deepseek|kimi|minimax> \"prompt\""; exit 2; }
+
+case "$agent" in
+  gemini)   base="https://generativelanguage.googleapis.com/v1beta/openai"; key="${GEMINI_API_KEY:-}";   model="${GEMINI_MODEL:-gemini-3.6-flash}";;
+  openai|codex) base="https://api.openai.com/v1"; key="${OPENAI_API_KEY:-}"; model="${OPENAI_MODEL:-gpt-4o-mini}";;
+  deepseek) base="https://api.deepseek.com";     key="${DEEPSEEK_API_KEY:-}"; model="${DEEPSEEK_MODEL:-deepseek-chat}";;
+  kimi)     base="https://api.moonshot.ai/v1";    key="${MOONSHOT_API_KEY:-}"; model="${MOONSHOT_MODEL:-kimi-k2-0711-preview}";;
+  minimax)  base="https://api.minimax.chat/v1";   key="${MINIMAX_API_KEY:-}";  model="${MINIMAX_MODEL:-abab6.5s-chat}";;
+  *) echo "unknown agent: $agent"; exit 2;;
+esac
+
+[ -z "$key" ] && { echo "[$agent] no API key set — add it to $KEYS"; exit 3; }
+
+payload=$(python3 -c 'import json,sys; print(json.dumps({"model":sys.argv[1],"messages":[{"role":"user","content":sys.argv[2]}]}))' "$model" "$prompt")
+resp=$(curl -s -m 120 "$base/chat/completions" -H "Authorization: Bearer $key" -H "Content-Type: application/json" -d "$payload")
+echo "$resp" | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin); print(d["choices"][0]["message"]["content"])
+except Exception:
+    print("[error]", sys.stdin.read() if False else json.dumps(d) if "d" in dir() else "bad response")' 2>/dev/null \
+  || echo "$resp"

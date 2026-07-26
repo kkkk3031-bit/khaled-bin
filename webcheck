@@ -1,0 +1,69 @@
+#!/bin/bash
+# webcheck — auto-fetch ALL Railway + Vercel app URLs and test which are working.
+# Usage: webcheck            (uses cached URL list, fast)
+#        webcheck --refresh  (re-fetch URL lists from Railway + Vercel APIs first)
+set -u
+CACHE=~/.cache/webcheck
+mkdir -p "$CACHE"
+
+refresh_railway() {
+  echo "Fetching Railway domains..."
+  local tmp; tmp=$(mktemp -d)
+  cd "$tmp" || return 1
+  railway list --json 2>/dev/null > projects.json
+  python3 - << 'PYEOF' > "$CACHE/railway.txt"
+import json, subprocess
+for p in json.load(open('projects.json')):
+    envs = p['environments']['edges']
+    if not envs: continue
+    env = envs[0]['node']['name']
+    r = subprocess.run(['railway','link','--project',p['id'],'--environment',env],
+                       capture_output=True, timeout=30)
+    if r.returncode != 0: continue
+    r = subprocess.run(['railway','status','--json'], capture_output=True, text=True, timeout=30)
+    try: d = json.loads(r.stdout)
+    except Exception: continue
+    for e in d.get('environments',{}).get('edges',[]):
+        for si in e['node'].get('serviceInstances',{}).get('edges',[]):
+            doms = si['node'].get('domains') or {}
+            for x in doms.get('serviceDomains',[]) + doms.get('customDomains',[]):
+                print(f"{p['name']}\t{x['domain']}", flush=True)
+PYEOF
+  cd - >/dev/null; rm -rf "$tmp"
+}
+
+refresh_vercel() {
+  echo "Fetching Vercel URLs..."
+  { vercel project ls 2>/dev/null; vercel project ls --next 9999999999999 2>/dev/null; } |
+    grep -oE '[a-zA-Z0-9-]+ +https://[a-z0-9.-]+\.vercel\.app' |
+    awk '{gsub("https://","",$2); print $1"\t"$2}' > "$CACHE/vercel.txt"
+  # fallback: pull all pages via --next token loop is not supported; keep page1 + known page2
+  if [ ! -s "$CACHE/vercel.txt" ]; then
+    vercel project ls 2>&1 | grep -oE 'https://[a-z0-9.-]+\.vercel\.app' | sed 's|https://||; s|^|?\t|' > "$CACHE/vercel.txt"
+  fi
+}
+
+if [ "${1:-}" = "--refresh" ] || [ ! -s "$CACHE/railway.txt" ]; then refresh_railway; fi
+if [ "${1:-}" = "--refresh" ] || [ ! -s "$CACHE/vercel.txt" ]; then refresh_vercel; fi
+
+echo "Testing all URLs..."
+{
+  sed 's/^/railway\t/' "$CACHE/railway.txt"
+  sed 's/^/vercel\t/'  "$CACHE/vercel.txt"
+} | while IFS=$'\t' read -r plat name dom; do
+  [ -z "$dom" ] && continue
+  echo "$plat|$name|$dom"
+done | xargs -P 30 -I{} bash -c '
+  IFS="|" read -r plat name dom <<< "{}"
+  code=$(curl -s -o /dev/null -w "%{http_code}" -m 12 "https://$dom/")
+  printf "%s\t%s\t%s\t%s\n" "$code" "$plat" "$name" "$dom"
+' | sort > "$CACHE/results.txt"
+
+echo
+echo "=== ✅ WORKING (2xx/3xx) ==="
+awk -F'\t' '$1 ~ /^[23]/ {printf "%-4s %-8s %-28s https://%s\n",$1,$2,$3,$4}' "$CACHE/results.txt"
+echo
+echo "=== ❌ DOWN (4xx/5xx/000) ==="
+awk -F'\t' '$1 !~ /^[23]/ {printf "%-4s %-8s %-28s https://%s\n",$1,$2,$3,$4}' "$CACHE/results.txt"
+echo
+awk -F'\t' 'BEGIN{u=0;d=0} $1~/^[23]/{u++} $1!~/^[23]/{d++} END{print "TOTAL: "u" working, "d" down"}' "$CACHE/results.txt"

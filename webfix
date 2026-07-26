@@ -1,0 +1,24 @@
+#!/bin/bash
+# webfix — auto flow: run webcheck; if any baseline (should-be-up) app is down,
+# launch Claude headless to read its Railway/Vercel logs and auto-fix + redeploy.
+# Cron-safe. Logs to ~/.cache/webcheck/webfix.log
+export PATH="$HOME/bin:$HOME/.local/bin:$HOME/.railway/bin:/usr/local/bin:/usr/bin:/bin"
+CACHE=~/.cache/webcheck
+LOG=$CACHE/webfix.log
+echo "=== $(date '+%F %T') webfix run ===" >> "$LOG"
+
+~/bin/webcheck > "$CACHE/last.log" 2>&1
+
+DOWN=$(comm -12 <(sort "$CACHE/baseline.txt") \
+                <(awk -F'\t' '$1 !~ /^[23]/ {print $4}' "$CACHE/results.txt" | sort))
+
+if [ -z "$DOWN" ]; then
+  echo "all baseline apps UP" >> "$LOG"
+  exit 0
+fi
+
+echo "DOWN: $DOWN" >> "$LOG"
+claude -p --dangerously-skip-permissions "These app domains of mine are DOWN and should be up: $DOWN
+For each one: find which Railway project it belongs to (railway list --json, link with 'railway link --project <id> --environment production' in a temp dir), read the deploy/runtime logs (railway logs), diagnose the crash from the console output, fix the code in the matching repo under /home/khaled if needed, redeploy with 'railway up --detach' from the repo root, then curl the URL until it returns 200. If it's a Vercel app use 'vercel logs <url>' and 'vercel redeploy'. Keep every command under 30s timeout where possible. Report what you fixed." >> "$LOG" 2>&1
+
+echo "=== webfix done $(date '+%F %T') ===" >> "$LOG"

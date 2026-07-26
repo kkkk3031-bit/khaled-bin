@@ -1,0 +1,51 @@
+#!/bin/bash
+# newclone <url> [name] — create a new clone project from ~/ai-website-cloner-template
+# Copies the template into ~/clones/<name>, installs deps, patches dev config, prints next step.
+set -e
+TEMPLATE=~/ai-website-cloner-template
+CLONES=~/clones
+url="$1"
+[ -z "$url" ] && { echo "usage: newclone <url> [name]"; exit 1; }
+name="${2:-$(echo "$url" | sed -E 's~https?://~~; s~^www\.~~; s~[/?#].*$~~; s~\.~-~g')}"
+dir="$CLONES/$name"
+[ -e "$dir" ] && { echo "exists: $dir"; exit 1; }
+mkdir -p "$CLONES"
+
+# copy template (skip node_modules, .git, .next)
+rsync -a --exclude node_modules --exclude .git --exclude .next "$TEMPLATE/" "$dir/"
+cd "$dir"
+
+# strip the cloner launcher UI from the copy — clones start from the clean placeholder
+rm -rf src/app/api/clone
+cat > src/app/page.tsx <<'PAGE'
+export default function Home() {
+  return (
+    <main className="flex min-h-screen items-center justify-center">
+      <p className="text-muted-foreground">
+        Clone target not yet built. Run <code className="font-mono text-foreground">/clone-website</code> to start.
+      </p>
+    </main>
+  );
+}
+PAGE
+git init -q && git add -A && git commit -qm "template base for $name"
+
+# pick a free port starting at 3001
+port=3001
+while fuser "$port"/tcp >/dev/null 2>&1 || grep -rqs "\"dev\":.*-p $port" "$CLONES"/*/package.json 2>/dev/null; do
+  port=$((port+1))
+done
+# pin the port into the dev script
+sed -i "s/\"dev\": \"next dev\"/\"dev\": \"next dev -p $port\"/" package.json
+
+echo "==> installing deps..."
+npm install --silent 2>&1 | tail -1 || true
+
+cat <<EOF
+
+  Project : $dir
+  Target  : $url
+  Dev     : cd $dir && npm run dev   →  http://72.60.89.132:$port
+  Clone   : run Claude in $dir and use  /clone-website $url
+EOF
+echo "$url" > .clone-target

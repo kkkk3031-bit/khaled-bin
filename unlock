@@ -1,0 +1,9 @@
+#!/bin/bash
+# unlock — run ONCE as root: gives khaled passwordless sudo + lets Claude (khaled) run root tasks
+[ "$(id -u)" = 0 ] || { echo "must run as root: ssh -t root@72.60.89.132 /home/khaled/bin/unlock"; exit 1; }
+echo 'khaled ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/khaled
+chmod 440 /etc/sudoers.d/khaled
+mkdir -p /root/.ssh && chmod 700 /root/.ssh
+grep -qf /home/khaled/.ssh/id_ed25519.pub /root/.ssh/authorized_keys 2>/dev/null || cat /home/khaled/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+echo "UNLOCKED: passwordless sudo ON, Claude can now auto-run everything"

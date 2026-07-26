@@ -1,0 +1,66 @@
+#!/bin/bash
+# clone-job <url> — full auto clone pipeline (called by the cloner web UI on :3000)
+# newclone → opencode /clone → start dev server → status json for the UI
+export PATH="$HOME/.local/bin:$HOME/bin:/snap/bin:$PATH"
+url="$1"
+[ -z "$url" ] && { echo "usage: clone-job <url>"; exit 1; }
+name=$(echo "$url" | sed -E 's~https?://~~; s~^www\.~~; s~[/?#].*$~~; s~:[0-9]+$~~; s~\.~-~g')
+jobdir=~/clones/.jobs; mkdir -p "$jobdir"
+job="$jobdir/$name.json"
+log="$jobdir/$name.log"
+upd(){ printf '{"name":"%s","url":"%s","status":"%s","port":%s,"updated":"%s"}\n' \
+  "$name" "$url" "$1" "${2:-0}" "$(date -Is)" > "$job"; }
+
+upd setup
+echo "[$(date -Is)] setup: $url" >> "$log"
+if [ -d ~/clones/"$name" ]; then
+  echo "project exists, reusing ~/clones/$name" >> "$log"
+else
+  ~/bin/newclone "$url" "$name" >> "$log" 2>&1 || { upd error; exit 1; }
+fi
+port=$(grep -oE 'next dev -p [0-9]+' ~/clones/"$name"/package.json | grep -oE '[0-9]+$')
+[ -z "$port" ] && port=0
+
+cd ~/clones/"$name" || { upd error "$port"; exit 1; }
+
+# self-heal: older clones may be missing the headless /clone command — copy from template
+if [ ! -f .opencode/commands/clone.md ] && [ -f ~/ai-website-cloner-template/.opencode/commands/clone.md ]; then
+  mkdir -p .opencode/commands
+  cp ~/ai-website-cloner-template/.opencode/commands/clone.md .opencode/commands/
+  echo "[$(date -Is)] self-heal: copied /clone command from template" >> "$log"
+fi
+
+# skip the AI build if the page is already built (placeholder gone) — go straight to serving
+already_built=0
+if [ -f src/app/page.tsx ] && ! grep -q "Clone target not yet built" src/app/page.tsx; then
+  already_built=1
+  echo "[$(date -Is)] page already built — skipping AI step" >> "$log"
+fi
+
+exit_code=0
+if [ "$already_built" -eq 0 ]; then
+  upd cloning "$port"
+  echo "[$(date -Is)] opencode /clone $url" >> "$log"
+  # stdbuf keeps output streaming line-by-line into the log for the UI
+  stdbuf -oL -eL opencode run "/clone $url" --print-logs >> "$log" 2>&1
+  exit_code=$?
+  echo "[$(date -Is)] opencode exit=$exit_code" >> "$log"
+fi
+
+# even if opencode exited non-zero, serve the site when it actually produced a page
+if [ "$exit_code" -ne 0 ] && grep -q "Clone target not yet built" src/app/page.tsx 2>/dev/null; then
+  echo "[$(date -Is)] opencode failed (exit $exit_code) and no page was built" >> "$log"
+  upd error "$port"
+  exit 1
+fi
+[ "$exit_code" -ne 0 ] && echo "[$(date -Is)] opencode exit $exit_code but page exists — serving anyway" >> "$log"
+
+upd starting "$port"
+echo "[$(date -Is)] starting dev server on :$port" >> "$log"
+fuser -k "$port"/tcp 2>/dev/null; sleep 1
+nohup npm run dev >> "$log" 2>&1 &
+for i in $(seq 1 20); do
+  sleep 3
+  curl -fsS -o /dev/null "http://localhost:$port" && { upd live "$port"; echo "[$(date -Is)] LIVE http://72.60.89.132:$port" >> "$log"; exit 0; }
+done
+upd error "$port"

@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# mcpfix — auto-repair + auto-reconnect for all Claude Code MCP servers.
+# Run by cron (*/30) and @reboot. Log: ~/.cache/mcpfix.log
+#   mcpfix          -> check + fix
+#   mcpfix status   -> just print health
+set -uo pipefail
+
+# cron's PATH has neither claude (~/.local/bin) nor vercel (~/.npm-global/bin)
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/bin:$PATH"
+
+LOG=~/.cache/mcpfix.log
+STATE=~/.cache/mcpfix.state
+AUTH=~/.local/share/com.vercel.cli/auth.json
+NEEDAUTH=~/.claude/mcp-needs-auth-cache.json
+PLUGDIR=~/.claude/plugins/cache/claude-plugins-official/vercel
+mkdir -p ~/.cache
+log(){ echo "$(date '+%F %T') $*" >> "$LOG"; }
+say(){ echo "$*"; log "$*"; }
+
+# ---------- 1. Vercel: keep bearer token fresh + injected into plugin MCP config ----------
+fix_vercel(){
+  [ -f "$AUTH" ] || { log "vercel: no CLI auth.json — run 'vercel login'"; return 1; }
+  # force a refresh if the CLI token is stale (cheap call, refreshes auth.json)
+  timeout 30 vercel whoami >/dev/null 2>&1
+  local tok
+  tok=$(python3 -c "import json;print(json.load(open('$AUTH')).get('token',''))" 2>/dev/null)
+  [ -n "$tok" ] || { log "vercel: no token in auth.json"; return 1; }
+
+  local patched=0
+  for f in "$PLUGDIR"/*/.mcp.json; do
+    [ -f "$f" ] || continue
+    python3 - "$f" "$tok" <<'PY' && patched=1
+import json,sys
+f,tok=sys.argv[1],sys.argv[2]
+d=json.load(open(f))
+s=d.get("mcpServers",{}).get("vercel")
+if not s: sys.exit(1)
+want={"Authorization":"Bearer "+tok}
+if s.get("headers")==want: sys.exit(2)          # already correct
+s["headers"]=want
+json.dump(d,open(f,"w"),indent=2)
+sys.exit(0)
+PY
+  done
+  [ "$patched" = 1 ] && log "vercel: bearer token injected into plugin .mcp.json (restart Claude to pick up)"
+
+  # verify the token actually works against the live endpoint
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 -X POST https://mcp.vercel.com \
+    -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"mcpfix","version":"1"}}}')
+  if [ "$code" = 200 ]; then
+    # drop stale "needs authentication" cache so the CLI retries instead of skipping
+    [ -f "$NEEDAUTH" ] && python3 -c "
+import json
+try: d=json.load(open('$NEEDAUTH'))
+except Exception: d={}
+d.pop('plugin:vercel:vercel',None)
+json.dump(d,open('$NEEDAUTH','w'))" 2>/dev/null
+    return 0
+  fi
+  log "vercel: endpoint returned HTTP $code with CLI token"
+  return 1
+}
+
+# ---------- 2. Health check every server ----------
+health(){ timeout 90 claude mcp list 2>&1 | grep -E ' - ' ; }
+
+main(){
+  fix_vercel
+  local out bad=0
+  out=$(health)
+  echo "$out"
+  log "health:"; echo "$out" | sed 's/^/    /' >> "$LOG"
+
+  while IFS= read -r line; do
+    case "$line" in
+      *"✔ Connected"*) : ;;
+      "") : ;;
+      *) bad=1
+         name=${line%%: http*}                       # "plugin:vercel:vercel" — split on the URL, not the 1st colon
+         say "BROKEN: $line"
+         case "$line" in
+           *vercel*) fix_vercel && say "  -> vercel token re-injected; reconnects on next Claude start" ;;
+           *) say "  -> $name is a claude.ai connector: token is managed by the CLI. If it stays broken, re-run /mcp in a Claude session to re-authorize." ;;
+         esac ;;
+    esac
+  done <<< "$out"
+
+  # 2-strike escalation: only shout if broken twice in a row
+  local prev=0; [ -f "$STATE" ] && prev=$(cat "$STATE")
+  echo "$bad" > "$STATE"
+  if [ "$bad" = 1 ] && [ "$prev" = 1 ]; then
+    log "ESCALATE: MCP servers broken 2 runs in a row"
+    if [ -f ~/vault/Tasks/inbox.md ]; then
+      echo "- [ ] !claude MCP server(s) still failing after auto-fix — check ~/.cache/mcpfix.log, diagnose and repair" >> ~/vault/Tasks/inbox.md
+      log "escalation queued in vault inbox"
+    fi
+  fi
+  return 0
+}
+
+case "${1:-fix}" in
+  status) health ;;
+  *) main ;;
+esac

@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# crew — one job, three AIs, each doing the part it is best at.
+#
+#   claude  plans and arbitrates   (prompting, architecture, final verify)
+#   gemini  designs the interface  (layout, colour, type, icons, copy)
+#   codex   writes the code        (implementation, in the real project dir)
+#
+# They are not asked the same question in parallel like `council` does — each
+# stage is handed the previous stage's output, and there is a review round where
+# the designer critiques the built UI and the coder answers with fixes. Every
+# prompt and reply is written to .crew/<run>/ so a run can be read back later.
+#
+# Usage:
+#   crew "<goal>" [-d <project-dir>] [--rounds N] [--no-build] [--dry]
+#   crew --status                       what each agent can do right now
+#
+# Auth (checked by --status):
+#   claude  Claude Code CLI, already logged in
+#   codex   ChatGPT login (codex login) — no API key needed
+#   gemini  GEMINI_API_KEY in ~/.config/ai-council/keys.env
+set -uo pipefail
+
+KEYS=$HOME/.config/ai-council/keys.env
+[ -f "$KEYS" ] && { set -a; . "$KEYS"; set +a; }
+
+DIR=$PWD
+ROUNDS=1
+DO_BUILD=1
+DRY=0
+GOAL=""
+
+# Per-call ceilings. A stuck agent must not hold the whole run.
+T_PLAN=${CREW_T_PLAN:-600}
+T_DESIGN=${CREW_T_DESIGN:-420}
+T_CODE=${CREW_T_CODE:-1800}
+T_REVIEW=${CREW_T_REVIEW:-420}
+
+c_bold=$'\033[1m'; c_amber=$'\033[38;5;214m'; c_dim=$'\033[2m'; c_red=$'\033[31m'; c_off=$'\033[0m'
+
+say()  { printf "%s\n" "$*"; }
+head1() { printf "\n%s%s%s\n" "$c_amber$c_bold" "$*" "$c_off"; }
+dim()  { printf "%s%s%s\n" "$c_dim" "$*" "$c_off"; }
+die()  { printf "%s%s%s\n" "$c_red" "$*" "$c_off" >&2; exit 1; }
+
+have_gemini() { [ -n "${GEMINI_API_KEY// /}" ] && command -v gemini >/dev/null; }
+# `codex login status` prints to stderr, so 2>&1 or this is always "not logged in".
+have_codex()  { command -v codex >/dev/null && codex login status 2>&1 | grep -qi "logged in"; }
+have_claude() { command -v claude >/dev/null; }
+
+status() {
+  head1 "crew — agent status"
+  printf "  %-8s %-28s %s\n" claude "plan · arbitrate · verify" \
+    "$(have_claude && echo "✅ ready" || echo "❌ claude CLI missing")"
+  printf "  %-8s %-28s %s\n" gemini "UI/UX · colour · type · copy" \
+    "$(have_gemini && echo "✅ ready (${GEMINI_MODEL:-default})" || echo "❌ no GEMINI_API_KEY")"
+  printf "  %-8s %-28s %s\n" codex "implementation · refactor" \
+    "$(have_codex && echo "✅ ready (ChatGPT login)" || echo "❌ run: codex login")"
+  echo
+  dim "  keys: $KEYS   ·   runs: <project>/.crew/"
+}
+
+[ $# -eq 0 ] && { status; echo; say "usage: crew \"<goal>\" [-d dir] [--rounds N] [--no-build] [--dry]"; exit 0; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --status) status; exit 0 ;;
+    -d|--dir) DIR=$(cd "$2" 2>/dev/null && pwd) || die "no such dir: $2"; shift 2 ;;
+    --rounds) ROUNDS=$2; shift 2 ;;
+    --no-build) DO_BUILD=0; shift ;;
+    --dry) DRY=1; shift ;;
+    -h|--help) status; exit 0 ;;
+    *) GOAL="${GOAL:+$GOAL }$1"; shift ;;
+  esac
+done
+[ -n "$GOAL" ] || die "give me a goal, e.g. crew \"add a share sheet to the KDL app\""
+
+RUN=$(date +%Y%m%d-%H%M%S)
+OUT="$DIR/.crew/$RUN"
+mkdir -p "$OUT" || die "cannot write $OUT"
+CTX="$OUT/context.md"
+
+{
+  echo "# crew run $RUN"
+  echo
+  echo "- goal: $GOAL"
+  echo "- project: $DIR"
+  echo "- started: $(date -Is)"
+} > "$OUT/README.md"
+
+head1 "crew · $RUN"
+say  "  goal:    $GOAL"
+say  "  project: $DIR"
+dim  "  log:     $OUT"
+
+# --- the three agents, each behind one function -----------------------------
+# Every agent gets: its role, the goal, and the run context so far. Output goes
+# to a file AND to the transcript, so the next agent can be handed real text
+# rather than a summary of a summary.
+
+ask_claude() { # <prompt-file> <out-file> <timeout>
+  have_claude || { echo "(claude unavailable)" > "$2"; return 1; }
+  timeout "$3" claude -p "$(cat "$1")" > "$2" 2>>"$OUT/errors.log"
+}
+
+ask_gemini() { # <prompt-file> <out-file> <timeout>
+  have_gemini || { echo "(gemini unavailable — no GEMINI_API_KEY)" > "$2"; return 1; }
+  # Trust flag: the CLI refuses to run headless in an untrusted folder.
+  ( cd "$DIR" && GEMINI_CLI_TRUST_WORKSPACE=true timeout "$3" \
+      gemini -p "$(cat "$1")" ) > "$2" 2>>"$OUT/errors.log"
+  # The CLI prints terminal advisories on stdout; drop them so the next agent
+  # is not handed "Ripgrep is not available" as if it were design guidance.
+  sed -i '/True color (24-bit) support not detected/d; /Ripgrep is not available/d; /Loaded cached credentials/d' "$2"
+}
+
+ask_codex() { # <prompt-file> <out-file> <timeout> [--write]
+  have_codex || { echo "(codex unavailable — run: codex login)" > "$2"; return 1; }
+  local extra=""
+  # Writing mode edits real files in $DIR; review mode only answers.
+  [ "${4:-}" = "--write" ] && extra="--dangerously-bypass-approvals-and-sandbox"
+  ( cd "$DIR" && timeout "$3" codex exec --skip-git-repo-check $extra \
+      "$(cat "$1")" ) > "$2" 2>>"$OUT/errors.log"
+}
+
+note() { # <title> <file> — append a stage to the shared context + transcript
+  {
+    echo
+    echo "## $1"
+    echo
+    cat "$2"
+  } >> "$CTX"
+}
+
+ctx_tail() { # last N chars of shared context, so prompts stay bounded
+  tail -c "${1:-6000}" "$CTX" 2>/dev/null
+}
+
+# --- stage 1: PLAN (claude) -------------------------------------------------
+head1 "1/5 · claude — plan"
+cat > "$OUT/p1-plan.txt" <<EOF
+You are the planner of a three-agent crew working on ONE job.
+
+The crew:
+- claude (you): planning, architecture, arbitration, final verification.
+- gemini: everything the user sees — layout, colour, typography, icons, imagery, copy.
+- codex: writing the actual code in the project.
+
+Project directory: $DIR
+$( [ -f "$DIR/CLAUDE.md" ] && echo "Project notes (CLAUDE.md):" && head -c 2000 "$DIR/CLAUDE.md" )
+$( ls "$DIR" 2>/dev/null | head -40 | sed 's/^/  /' | { echo "Top-level files:"; cat; } )
+
+THE GOAL: $GOAL
+
+Write a short, concrete plan. Required sections, nothing else:
+1. WHAT WE ARE BUILDING — 3 sentences max, no preamble.
+2. DESIGN BRIEF FOR GEMINI — the specific interface questions it must answer
+   (screens/components, colour, type, icon set, states, copy incl. Arabic where
+   the user-facing text needs it). Be concrete about this project, not generic.
+3. BUILD BRIEF FOR CODEX — the files to create or change, the behaviour, the
+   constraints (existing stack, no new heavy deps, keep the project's style).
+4. DONE MEANS — a short checklist that can actually be verified by running
+   something, not by opinion.
+Keep the whole thing under 400 words. No filler, no restating the goal.
+EOF
+
+if [ $DRY -eq 1 ]; then dim "  (dry run — prompt written to $OUT/p1-plan.txt)"; else
+  ask_claude "$OUT/p1-plan.txt" "$OUT/1-plan.md" $T_PLAN \
+    && say "  ✓ plan → $(wc -l < "$OUT/1-plan.md") lines" || say "  ${c_red}✗ planner failed$c_off"
+  note "PLAN (claude)" "$OUT/1-plan.md"
+  sed -n '1,12p' "$OUT/1-plan.md" | sed 's/^/  │ /'
+fi
+
+# --- stage 2: DESIGN (gemini) ----------------------------------------------
+head1 "2/5 · gemini — interface design"
+cat > "$OUT/p2-design.txt" <<EOF
+You are the interface designer of a three-agent crew. You do NOT write the
+application code — you decide what the user sees and hand the coder a spec it
+can implement without guessing.
+
+THE GOAL: $GOAL
+PROJECT: $DIR
+
+The planner said:
+$(cat "$OUT/1-plan.md" 2>/dev/null | head -c 4000)
+
+Answer ONLY the design brief, as a spec a coder can follow literally:
+- SCREENS/COMPONENTS: each one, what is on it, in what order.
+- LAYOUT: sizes, spacing, breakpoints — real numbers.
+- COLOUR: exact hex values, and which is used where. Say what the dark and
+  light variants are if the project has both.
+- TYPE: font stack, sizes, weights, line-height. If the copy can be Arabic,
+  give the Arabic-capable stack and the RTL rules.
+- ICONS/IMAGERY: what set, what style, what each icon is for.
+- STATES: empty, loading, error, success — what the user sees in each.
+- COPY: the actual strings, in English and Arabic where users read them.
+Be decisive. No options, no "you could". No code.
+EOF
+
+if [ $DRY -eq 1 ]; then dim "  (dry run)"; else
+  ask_gemini "$OUT/p2-design.txt" "$OUT/2-design.md" $T_DESIGN \
+    && say "  ✓ design → $(wc -l < "$OUT/2-design.md") lines" || say "  ${c_red}✗ designer failed$c_off"
+  note "DESIGN (gemini)" "$OUT/2-design.md"
+  sed -n '1,12p' "$OUT/2-design.md" | sed 's/^/  │ /'
+fi
+
+# --- stage 3: BUILD (codex) -------------------------------------------------
+head1 "3/5 · codex — build"
+cat > "$OUT/p3-build.txt" <<EOF
+You are the implementer of a three-agent crew. Write the real code, in this
+repository, now. Do not describe what you would do — do it.
+
+THE GOAL: $GOAL
+
+The planner's build brief and the designer's spec:
+$(ctx_tail 9000)
+
+Rules:
+- Work inside $DIR. Match the existing stack, style and comment density.
+- Follow the design spec exactly where it gives numbers, colours or strings.
+- No new heavy dependencies without saying why in your summary.
+- When you are done, print a short SUMMARY: files changed, and how to verify.
+EOF
+
+if [ $DRY -eq 1 ]; then dim "  (dry run)"; elif [ $DO_BUILD -eq 0 ]; then dim "  (skipped: --no-build)"; else
+  ask_codex "$OUT/p3-build.txt" "$OUT/3-build.md" $T_CODE --write \
+    && say "  ✓ build → $(wc -l < "$OUT/3-build.md") lines" || say "  ${c_red}✗ builder failed$c_off"
+  note "BUILD (codex)" "$OUT/3-build.md"
+  tail -n 12 "$OUT/3-build.md" | sed 's/^/  │ /'
+fi
+
+# --- stage 4: REVIEW ROUNDS (gemini ↔ codex) --------------------------------
+# This is the part `council` cannot do: the designer looks at what was actually
+# built and the coder answers with changes, not with an opinion.
+r=1
+while [ "$r" -le "$ROUNDS" ] && [ $DRY -eq 0 ] && [ $DO_BUILD -eq 1 ]; do
+  head1 "4/5 · review round $r · gemini → codex"
+  cat > "$OUT/p4-review-$r.txt" <<EOF
+You are the designer reviewing what the coder just built against YOUR spec.
+
+THE GOAL: $GOAL
+Your spec and the coder's report:
+$(ctx_tail 9000)
+
+Look at the actual files in $DIR that the coder listed. For each deviation from
+your spec, write one line:
+  FIX <file> — <what is wrong> → <exactly what it should be>
+Only list things that are genuinely wrong or missing. If the build matches the
+spec, write exactly: NO CHANGES NEEDED
+Do not rewrite the spec. Maximum 10 lines.
+EOF
+  ask_gemini "$OUT/p4-review-$r.txt" "$OUT/4-review-$r.md" $T_REVIEW
+  note "REVIEW round $r (gemini)" "$OUT/4-review-$r.md"
+  sed -n '1,10p' "$OUT/4-review-$r.md" | sed 's/^/  │ /'
+
+  if grep -qi "NO CHANGES NEEDED" "$OUT/4-review-$r.md"; then
+    say "  ✓ designer signed off"
+    break
+  fi
+
+  head1 "4/5 · review round $r · codex applies"
+  cat > "$OUT/p4-fix-$r.txt" <<EOF
+The designer reviewed your build and asked for these changes:
+
+$(cat "$OUT/4-review-$r.md")
+
+Apply the ones that are correct, in $DIR. If one of them is wrong for a reason
+the designer cannot see (it breaks the build, the framework forbids it, it
+contradicts the planner's constraints), do NOT apply it — instead reply on one
+line: DISAGREE <item> — <reason>. Print a SUMMARY of what you changed.
+EOF
+  ask_codex "$OUT/p4-fix-$r.txt" "$OUT/4-fix-$r.md" $T_CODE --write
+  note "FIXES round $r (codex)" "$OUT/4-fix-$r.md"
+  tail -n 10 "$OUT/4-fix-$r.md" | sed 's/^/  │ /'
+  r=$((r+1))
+done
+
+# --- stage 5: VERIFY (claude) ----------------------------------------------
+head1 "5/5 · claude — verify"
+cat > "$OUT/p5-verify.txt" <<EOF
+You are the arbiter of a three-agent crew. The job is finished; judge it.
+
+THE GOAL: $GOAL
+PROJECT: $DIR
+
+Full run transcript:
+$(ctx_tail 12000)
+
+Recent changes in the project:
+$(cd "$DIR" && git status --short 2>/dev/null | head -30)
+$(cd "$DIR" && git diff --stat 2>/dev/null | tail -15)
+
+Write, briefly:
+1. DONE — which checklist items are genuinely satisfied.
+2. NOT DONE — what is missing or wrong, and who should pick it up.
+3. VERIFY WITH — the exact command(s) to run to check this for real.
+4. NEXT — the single most useful next step.
+Under 250 words. Do not praise the work.
+EOF
+
+if [ $DRY -eq 1 ]; then dim "  (dry run)"; else
+  ask_claude "$OUT/p5-verify.txt" "$OUT/5-verdict.md" $T_PLAN \
+    && say "  ✓ verdict" || say "  ${c_red}✗ arbiter failed$c_off"
+  note "VERDICT (claude)" "$OUT/5-verdict.md"
+  echo
+  cat "$OUT/5-verdict.md" | sed 's/^/  /'
+fi
+
+head1 "done"
+say  "  transcript: $CTX"
+say  "  stages:     $OUT"
+[ -s "$OUT/errors.log" ] && dim "  errors:     $OUT/errors.log ($(wc -l < "$OUT/errors.log") lines)"
+exit 0

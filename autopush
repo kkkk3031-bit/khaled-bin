@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# autopush — keep every project on this VPS committed, pushed and live.
+#
+#   autopush              commit + push every repo, redeploy the ones that changed
+#   autopush --status     what it would do, without touching anything
+#   autopush --push-only  commit + push, never deploy
+#   autopush <repo>       just that one repo (still honours the deploy map)
+#
+# Per repo:  dirty tree -> commit  ->  push  ->  (if new commits AND repo is in
+# the deploy map) deploy -> health-check the live URL.  A failed health check
+# logs a strike; two strikes in a row queue a job for Claude in the vault inbox.
+#
+# Two deliberate safeguards:
+#   * QUIET_MIN — a file still being edited is NOT committed. The whole repo is
+#     skipped until its newest change has been sitting still for a few minutes,
+#     so a half-saved edit can never reach production.
+#   * deploy.map is opt-in. A repo with no entry is only ever pushed to GitHub;
+#     nothing goes live unless it was listed on purpose.
+set -u
+LOG=$HOME/.cache/autopush.log
+STATE=$HOME/.cache/autopush
+CONF=$HOME/.config/autopush
+MAP=$CONF/deploy.map
+SKIP=$CONF/skip
+LOCK=$HOME/.cache/autopush.lock
+QUIET_MIN=5
+mkdir -p "$STATE" "$CONF"
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+say() { echo "$*"; }
+
+MODE=run; ONLY=""
+case "${1:-}" in
+  --status)    MODE=status ;;
+  --push-only) MODE=push ;;
+  "")          ;;
+  -*)          echo "unknown flag: $1"; exit 2 ;;
+  *)           ONLY="$1" ;;
+esac
+
+# One run at a time — a railway build can outlast the cron interval.
+# --status only reads, so it must never wait on (or be blocked by) the lock.
+if [ "$MODE" != status ]; then
+  exec 9>"$LOCK"
+  flock -n 9 || { log "another autopush is still running — skipped"; exit 0; }
+fi
+
+# repo|deploy command|health URL   (missing file = push-only for everything)
+deploy_for() { [ -f "$MAP" ] && awk -F'|' -v r="$1" '$1==r{print $2"|"$3; exit}' "$MAP"; }
+skipped()    { [ -f "$SKIP" ] && grep -qxF "$1" "$SKIP"; }
+
+# Newest mtime among the files git reports as changed, in minutes ago.
+quiet_for() {
+  local repo=$1 newest=0 now f mt
+  now=$(date +%s)
+  while IFS= read -r f; do
+    [ -e "$repo/$f" ] || continue
+    mt=$(stat -c %Y "$repo/$f" 2>/dev/null) || continue
+    [ "$mt" -gt "$newest" ] && newest=$mt
+  done < <(git -C "$repo" status --porcelain | sed 's/^...//; s/^"//; s/"$//')
+  [ "$newest" = 0 ] && { echo 999; return; }
+  echo $(( (now - newest) / 60 ))
+}
+
+escalate() {
+  local repo=$1 why=$2 inbox=$HOME/vault/Tasks/inbox.md
+  [ -f "$inbox" ] || return 0
+  grep -qF "autopush: $repo" "$inbox" && return 0
+  echo "- [ ] !claude autopush: $repo $why — diagnose, fix, redeploy, verify the live URL" >> "$inbox"
+  log "  queued a vault job for $repo"
+}
+
+deployed=0; pushed=0; committed=0; failed=0
+
+for gitdir in "$HOME"/*/.git; do
+  repo=${gitdir%/.git}
+  name=$(basename "$repo")
+  [ -n "$ONLY" ] && [ "$name" != "$ONLY" ] && continue
+  skipped "$name" && { [ "$MODE" = status ] && say "$name: skipped (skip list)"; continue; }
+
+  dirty=$(git -C "$repo" status --porcelain | wc -l)
+  ahead=$(git -C "$repo" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+  has_remote=$(git -C "$repo" remote 2>/dev/null | head -1)
+
+  if [ "$MODE" = status ]; then
+    d=$(deploy_for "$name")
+    say "$(printf '%-26s dirty=%-3s ahead=%-3s %s' "$name" "$dirty" "$ahead" "${d:+deploy:${d%%|*}}")"
+    continue
+  fi
+
+  # --- commit -------------------------------------------------------------
+  if [ "$dirty" -gt 0 ]; then
+    q=$(quiet_for "$repo")
+    if [ "$q" -lt "$QUIET_MIN" ]; then
+      log "$name: changed ${q}m ago — still being edited, leaving it alone"
+      continue
+    fi
+    files=$(git -C "$repo" status --porcelain | sed 's/^...//' | head -3 | paste -sd', ')
+    [ "$dirty" -gt 3 ] && files="$files +$((dirty - 3)) more"
+    git -C "$repo" add -A >/dev/null 2>&1
+    if git -C "$repo" commit -qm "auto: $files" >/dev/null 2>&1; then
+      committed=$((committed + 1))
+      log "$name: committed $dirty file(s) — $files"
+    fi
+  fi
+
+  # --- push ---------------------------------------------------------------
+  ahead=$(git -C "$repo" rev-list --count '@{u}..HEAD' 2>/dev/null || echo unknown)
+  new=0
+  if [ -z "$has_remote" ]; then
+    [ "$dirty" -gt 0 ] && log "$name: no remote — committed locally only"
+  elif [ "$ahead" = unknown ]; then
+    if git -C "$repo" push -q -u origin HEAD >/dev/null 2>&1; then
+      new=1; pushed=$((pushed + 1)); log "$name: pushed (new upstream)"
+    else
+      failed=$((failed + 1)); log "$name: ❌ push failed (no upstream, push -u rejected)"
+    fi
+  elif [ "$ahead" -gt 0 ]; then
+    if git -C "$repo" push -q origin HEAD >/dev/null 2>&1; then
+      new=1; pushed=$((pushed + 1)); log "$name: pushed $ahead commit(s)"
+    else
+      failed=$((failed + 1)); log "$name: ❌ push failed ($ahead commit(s) still local)"
+    fi
+  fi
+
+  # --- deploy + verify ----------------------------------------------------
+  [ "$MODE" = push ] && continue
+  [ "$new" = 1 ] || continue
+  entry=$(deploy_for "$name"); [ -n "$entry" ] || continue
+  cmd=${entry%%|*}; url=${entry#*|}
+
+  log "$name: deploying — $cmd"
+  # 9>&- is essential: a deploy that backgrounds a daemon (twitter-dl relaunches
+  # node) would otherwise pass the inherited lock fd to it and hold the lock for
+  # the daemon's whole lifetime — every later run then skipped itself silently.
+  if (cd "$repo" && exec 9>&-; timeout 900 bash -c "$cmd" >> "$LOG" 2>&1); then
+    sleep 10
+    if curl -fsS -o /dev/null -m 25 --retry 3 --retry-delay 5 "$url"; then
+      deployed=$((deployed + 1)); rm -f "$STATE/$name.strike"
+      log "$name: ✅ live and healthy — $url"
+    else
+      failed=$((failed + 1))
+      s=$(( $(cat "$STATE/$name.strike" 2>/dev/null || echo 0) + 1 )); echo "$s" > "$STATE/$name.strike"
+      log "$name: ❌ deployed but $url is unhealthy (strike $s)"
+      [ "$s" -ge 2 ] && escalate "$name" "deploys but the live URL fails"
+    fi
+  else
+    failed=$((failed + 1))
+    s=$(( $(cat "$STATE/$name.strike" 2>/dev/null || echo 0) + 1 )); echo "$s" > "$STATE/$name.strike"
+    log "$name: ❌ deploy command failed (strike $s) — last good build stays live"
+    [ "$s" -ge 2 ] && escalate "$name" "deploy command keeps failing"
+  fi
+done
+
+[ "$MODE" = status ] && exit 0
+if [ $((committed + pushed + deployed + failed)) -gt 0 ]; then
+  log "run done — $committed committed, $pushed pushed, $deployed deployed, $failed failed"
+fi
+exit 0

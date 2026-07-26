@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Obsidian → Claude Code runner. Executes one "!claude" task from
+# ~/vault/Tasks/inbox.md per run, writes the result back, saves durable
+# knowledge into Wiki/, logs, and syncs. Kill switch: ~/vault/.no-agent
+set -uo pipefail
+VAULT="$HOME/vault"; INBOX="$VAULT/Tasks/inbox.md"; LOG="$VAULT/Logs/agent-log.md"
+[ -f "$VAULT/.no-agent" ] && exit 0
+[ -f "$INBOX" ] || exit 0
+exec 9>/tmp/vault-agent.lock; flock -n 9 || exit 0
+cd "$VAULT"; git pull -q --rebase --no-edit 2>/dev/null || true
+
+mapfile -t L < "$INBOX"; changed=0
+for i in "${!L[@]}"; do
+  if [[ "${L[$i]}" =~ ^([[:space:]]*)-[[:space:]]\[[[:space:]]\][[:space:]]*!claude[[:space:]]+(.*)$ ]]; then
+    indent="${BASH_REMATCH[1]}"; task="${BASH_REMATCH[2]}"; ts=$(date -u +'%F %H:%M UTC')
+    echo "[$ts] $task" >> "$LOG"
+    prompt="You are Khaled's autonomous assistant, invoked from an Obsidian note.
+TASK: $task
+Rules: respect project isolation (never mix crafthost/five-m/fivem/taxiapp/beammp).
+If the task produces durable knowledge, ALSO save a clean note under $VAULT/Wiki/<Topic>.md and link it from Wiki/index.md.
+You may consult other AIs with: ask <gemini|deepseek|kimi|openai> \"...\"  or  council \"...\".
+Do NOT deploy unless the task explicitly says deploy. End with a 3-5 line markdown summary of what you did."
+    res=$(cd "$HOME" && timeout 1800 claude -p --dangerously-skip-permissions "$prompt" 2>&1) || res="(error/timeout) $res"
+    block=$(printf '%s' "$res" | sed 's/^/'"$indent"'  > /')
+    L[$i]="${indent}- [x] !claude ${task}  ✓ ${ts}"$'\n'"${indent}  > **Claude (${ts}):**"$'\n'"${block}"
+    changed=1; break
+  fi
+done
+if [ "$changed" = 1 ]; then
+  printf '%s\n' "${L[@]}" > "$INBOX"
+  git add -A; git commit -q -m "vault-agent: ran a task ($(date -u +%H:%M))" 2>/dev/null || true
+  git push -q 2>/dev/null || true
+fi

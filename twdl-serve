@@ -1,0 +1,51 @@
+#!/bin/bash
+# The one way to start the twitter-dl web server (port 4310).
+#
+# Why this exists: two things start it — the */10 cron watchdog and autopush's
+# deploy.map entry — and both used to run "fuser -k 4310/tcp; sleep 1; node
+# server.js" independently. When they overlapped, the second one bound before
+# the first had let go of the port and died on EADDRINUSE. This takes a lock,
+# does nothing at all if the server is already answering, and waits for the
+# kernel to really release the port before rebinding.
+set -u
+
+APP=$HOME/twitter-dl
+PORT=${PORT:-4310}
+LOG=$APP/server.log
+LOCK=$HOME/.cache/twdl-serve.lock
+
+exec 9>"$LOCK"
+flock -w 60 9 || { echo "another twdl-serve is running — skipped"; exit 0; }
+
+# -s not -sS: this gets polled while the server is still booting, and "couldn't
+# connect" chatter in server.log is exactly what the log watcher would flag.
+healthy()   { curl -fs -o /dev/null -m 10 "http://localhost:$PORT/"; }
+listening() { ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; }
+
+# "ensure" (the watchdog's job) leaves a working server alone; "restart" (the
+# deploy's job) always replaces it.
+if [ "${1:-ensure}" = "ensure" ] && healthy; then
+  exit 0
+fi
+
+fuser -k "$PORT/tcp" >/dev/null 2>&1
+for _ in $(seq 30); do listening || break; sleep 0.5; done
+if listening; then
+  echo "port $PORT still held after 15s — not starting a second server" >&2
+  exit 1
+fi
+
+cd "$APP" || exit 1
+# cron's PATH is /usr/bin:/bin, where node is v20; every other way this server
+# gets started picks up v24 from /usr/local/bin. Same binary for all of them.
+NODE=/usr/local/bin/node
+[ -x "$NODE" ] || NODE=$(command -v node) || { echo "no node found" >&2; exit 1; }
+# 9>&- so the server does not inherit the lock and hold it for its whole life.
+PORT=$PORT setsid nohup "$NODE" server.js >> "$LOG" 2>&1 < /dev/null 9>&- &
+
+for _ in $(seq 40); do
+  healthy && { echo "twitter-dl up on $PORT"; exit 0; }
+  sleep 0.5
+done
+echo "twitter-dl did not come up on $PORT" >&2
+exit 1

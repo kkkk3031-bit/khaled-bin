@@ -1,0 +1,3 @@
+# secrets never belong here — keys live in ~/.config/ai-council/keys.env
+*.env
+*key*

@@ -1,0 +1,20 @@
+#!/bin/bash
+# ai-job <id> <prompt...> — run a headless opencode command for the AI box on :3000
+export PATH="$HOME/.local/bin:$HOME/bin:/snap/bin:$PATH"
+id="$1"; shift
+prompt="$*"
+[ -z "$id" ] || [ -z "$prompt" ] && { echo "usage: ai-job <id> <prompt>"; exit 1; }
+dir=~/.cache/ai-box; mkdir -p "$dir"
+job="$dir/$id.json"; log="$dir/$id.log"
+esc(){ python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
+upd(){ printf '{"id":"%s","prompt":%s,"status":"%s","updated":"%s"}\n' \
+  "$id" "$(esc "$prompt")" "$1" "$(date -Is)" > "$job"; }
+
+upd running
+echo "[$(date -Is)] \$ $prompt" > "$log"
+cd ~
+if opencode run "$prompt" --print-logs >> "$log" 2>&1; then
+  upd done
+else
+  upd error
+fi

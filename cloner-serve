@@ -1,0 +1,6 @@
+#!/bin/bash
+# cloner-serve — build (if needed) and run the AI cloner UI on :3000 in production mode
+export PATH="/usr/bin:$HOME/bin:$PATH"
+cd ~/ai-website-cloner-template || exit 1
+[ -d .next ] && [ -f .next/BUILD_ID ] || npm run build >> ~/.cache/cloner-dev.log 2>&1
+exec npm run start >> ~/.cache/cloner-dev.log 2>&1
