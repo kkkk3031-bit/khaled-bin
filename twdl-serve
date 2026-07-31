@@ -40,6 +40,11 @@ cd "$APP" || exit 1
 # gets started picks up v24 from /usr/local/bin. Same binary for all of them.
 NODE=/usr/local/bin/node
 [ -x "$NODE" ] || NODE=$(command -v node) || { echo "no node found" >&2; exit 1; }
+# yt-dlp (the /api/mp3 fallback) needs a JS runtime or it drops formats and
+# warns on every call. deno lives outside the default PATH, so every start
+# path has to add it — otherwise a cron-started server quietly differs from a
+# hand-started one.
+[ -x "$HOME/.deno/bin/deno" ] && PATH="$HOME/.deno/bin:$PATH" && export PATH
 # 9>&- so the server does not inherit the lock and hold it for its whole life.
 PORT=$PORT setsid nohup "$NODE" server.js >> "$LOG" 2>&1 < /dev/null 9>&- &
 
