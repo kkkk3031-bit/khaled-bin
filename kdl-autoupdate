@@ -71,6 +71,17 @@ else
   FAILED="$FAILED youtube"
 fi
 
+# ---------- 2b. the y2mate.gs browser trick (YouTube MP4 primary path) --------
+# The endpoint itself probes the direct link before answering, so a green
+# {ok:true} here means the phone's MP4 button would work right now.
+if curl -s -m 240 "$TW/api/ytmp4?direct=1&url=$(enc 'https://www.youtube.com/watch?v=dQw4w9WgXcQ')" \
+   | python3 -c "import json,sys;d=json.load(sys.stdin);sys.exit(0 if (d.get('ok') and d.get('url','').startswith('https://')) else 1)"; then
+  log "OK y2mate-trick"
+else
+  log "FAIL y2mate-trick :: $(curl -s -m 240 "$TW/api/ytmp4?direct=1&url=$(enc 'https://www.youtube.com/watch?v=dQw4w9WgXcQ')" | head -c 140 | tr -d '\n')"
+  FAILED="$FAILED y2mate-trick"
+fi
+
 # ---------- 3. publish chain ----------
 BUILT=$(ls -t "$APP"/app/build/outputs/apk/release/*.apk 2>/dev/null | head -1)
 VC=$(grep -oP 'versionCode\s+\K[0-9]+' "$APP/app/build.gradle")
