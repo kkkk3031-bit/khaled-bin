@@ -1,0 +1,43 @@
+#!/bin/bash
+# The one way to start the local APK web server (port 4417).
+#
+# Why this exists: Railway (apkweb-production.up.railway.app) went down
+# 2026-08-11 when the whole Railway workspace subscription went INACTIVE
+# (see ~/.claude/projects/-home-khaled/memory/project_taxiapp.md). Rather
+# than depend on Railway billing to serve one static APK file, serve it
+# straight off this VPS. Same lock/ensure pattern as twdl-serve so the
+# cron watchdog and a manual restart never race on the port.
+set -u
+
+APP=$HOME/apkweb/public
+PORT=${PORT:-4417}
+LOG=$HOME/apkweb/server.log
+LOCK=$HOME/.cache/apkweb-serve.lock
+
+exec 9>"$LOCK"
+flock -w 60 9 || { echo "another apkweb-serve is running — skipped"; exit 0; }
+
+healthy()   { curl -fs -o /dev/null -m 10 "http://localhost:$PORT/taxiapp.apk"; }
+listening() { ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; }
+
+if [ "${1:-ensure}" = "ensure" ] && healthy; then
+  exit 0
+fi
+
+fuser -k "$PORT/tcp" >/dev/null 2>&1
+for _ in $(seq 30); do listening || break; sleep 0.5; done
+if listening; then
+  echo "port $PORT still held after 15s — not starting a second server" >&2
+  exit 1
+fi
+
+cd "$APP" || exit 1
+PYTHON=$(command -v python3) || { echo "no python3 found" >&2; exit 1; }
+setsid nohup "$PYTHON" -m http.server "$PORT" --bind 0.0.0.0 >> "$LOG" 2>&1 < /dev/null 9>&- &
+
+for _ in $(seq 40); do
+  healthy && { echo "apkweb up on $PORT"; exit 0; }
+  sleep 0.5
+done
+echo "apkweb did not come up on $PORT" >&2
+exit 1

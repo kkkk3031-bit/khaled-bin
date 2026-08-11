@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Release the TaxiApp Android APK automatically whenever mobile code changed.
+#
+#   taxiapp-apk-release            build + publish only if mobile sources changed
+#   taxiapp-apk-release --force    build + publish no matter what
+#   taxiapp-apk-release --status   what would happen, without doing it
+#
+# Mirrors ~/bin/kdl-release: one release per code change —
+#   sources changed → bump versionCode (build.gradle + appVersion.json, kept in
+#   lockstep so the JS bundle baked into THIS APK reports the right version) →
+#   gradlew assembleRelease → copy to the VPS-served apkweb dir → write
+#   taxiapp-version.json (App.tsx's checkForUpdate() polls this on launch) →
+#   commit + push → record the new source hash.
+#
+# Railway's apkweb hosting went down 2026-08-11 (workspace billing INACTIVE —
+# see project_taxiapp memory), so this publishes to ~/apkweb/public/ served by
+# ~/bin/apkweb-serve on :4417 instead of `railway up`.
+set -u
+APP=$HOME/taxiapp/mobile
+PUB=$HOME/apkweb/public
+LOG=$HOME/.cache/taxiapp-apk-release.log
+HASHFILE=$HOME/.cache/taxiapp-apk-release.hash
+LOCK=$HOME/.cache/taxiapp-apk-release.lock
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+# Everything that ends up inside the APK.
+srchash() {
+  find "$APP/src" "$APP/App.tsx" "$APP/android/app/build.gradle" -type f 2>/dev/null \
+    | sort | xargs sha1sum 2>/dev/null | sha1sum | cut -d' ' -f1
+}
+
+FORCE=0
+case "${1:-}" in
+  --force) FORCE=1 ;;
+  --status)
+    echo "current versionCode: $(grep -oP 'versionCode \K\d+' "$APP/android/app/build.gradle" | head -1)"
+    [ "$(srchash)" = "$(cat "$HASHFILE" 2>/dev/null)" ] \
+      && echo "sources unchanged — nothing to release" || echo "sources CHANGED — a release is due"
+    exit 0 ;;
+esac
+
+# A release build takes several minutes. Never start a second one on top.
+exec 9>"$LOCK"
+flock -n 9 || { log "another release is still running — skipped"; exit 0; }
+
+NOW=$(srchash)
+if [ "$FORCE" = 0 ] && [ "$NOW" = "$(cat "$HASHFILE" 2>/dev/null)" ]; then
+  exit 0
+fi
+
+cd "$APP/android" || exit 1
+VC=$(grep -oP 'versionCode \K\d+' app/build.gradle | head -1)
+OLDVN=$(grep -oP 'versionName "\K[^"]+' app/build.gradle)
+NEW=$((VC + 1))
+NEWVN="1.0.$NEW"
+
+sed -i -E "s/versionCode $VC/versionCode $NEW/; s/versionName \"[^\"]+\"/versionName \"$NEWVN\"/" app/build.gradle
+sed -i -E "s/\"versionCode\": [0-9]+/\"versionCode\": $NEW/" "$APP/src/appVersion.json"
+
+log "releasing v$NEWVN ($NEW)"
+if ./gradlew assembleRelease --no-daemon -q >> "$LOG" 2>&1; then
+  APK=app/build/outputs/apk/release/app-release.apk
+  if [ ! -f "$APK" ]; then
+    log "❌ gradle reported success but no APK at $APK — treating as failure"
+    sed -i -E "s/versionCode $NEW/versionCode $VC/; s/versionName \"$NEWVN\"/versionName \"$OLDVN\"/" app/build.gradle
+    sed -i -E "s/\"versionCode\": [0-9]+/\"versionCode\": $VC/" "$APP/src/appVersion.json"
+    exit 1
+  fi
+  cp "$APK" "$PUB/taxiapp.apk"
+  cat > "$PUB/taxiapp-version.json" <<JSON
+{"versionCode": $NEW, "versionName": "$NEWVN", "url": "http://72.60.89.132:4417/taxiapp.apk", "date": "$(date -I)"}
+JSON
+
+  # Hash the tree AS BUILT (post-bump), same reasoning as kdl-release: hashing
+  # before the bump would see "changed" again next tick and re-release forever.
+  srchash > "$HASHFILE"
+  cd "$HOME/taxiapp" || exit 1
+  git add -A >/dev/null 2>&1
+  git commit -qm "TaxiApp APK v$NEWVN (vc$NEW) — auto-released" >/dev/null 2>&1
+  git push -q origin HEAD >/dev/null 2>&1 && log "pushed to github" || log "git push failed (build still published)"
+  log "✅ published v$NEWVN ($NEW) to http://72.60.89.132:4417/taxiapp.apk — app prompts users to update on next launch"
+else
+  sed -i -E "s/versionCode $NEW/versionCode $VC/; s/versionName \"$NEWVN\"/versionName \"$OLDVN\"/" app/build.gradle
+  sed -i -E "s/\"versionCode\": [0-9]+/\"versionCode\": $VC/" "$APP/src/appVersion.json"
+  log "❌ build FAILED — nothing published, previous APK still live (version rolled back to $VC)"
+  exit 1
+fi
