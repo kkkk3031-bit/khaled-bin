@@ -1,0 +1,37 @@
+#!/bin/bash
+# Starts tweet-eraser (port 4320) if it isn't already answering.
+set -u
+APP=$HOME/tweet-eraser
+PORT=4320
+LOG=$APP/server.log
+LOCK=$HOME/.cache/te-serve.lock
+mkdir -p "$HOME/.cache"
+
+exec 9>"$LOCK"
+flock -w 60 9 || { echo "another te-serve is running — skipped"; exit 0; }
+
+healthy()   { curl -fs -o /dev/null -m 10 "http://localhost:$PORT/"; }
+listening() { ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; }
+
+if [ "${1:-ensure}" = "ensure" ] && healthy; then
+  exit 0
+fi
+
+fuser -k "$PORT/tcp" >/dev/null 2>&1
+for _ in $(seq 30); do listening || break; sleep 0.5; done
+if listening; then
+  echo "port $PORT still held after 15s — not starting a second server" >&2
+  exit 1
+fi
+
+cd "$APP" || exit 1
+NODE=/usr/local/bin/node
+[ -x "$NODE" ] || NODE=$(command -v node) || { echo "no node found" >&2; exit 1; }
+PORT=$PORT setsid nohup "$NODE" server.js >> "$LOG" 2>&1 < /dev/null 9>&- &
+
+for _ in $(seq 40); do
+  healthy && { echo "tweet-eraser up on $PORT"; exit 0; }
+  sleep 0.5
+done
+echo "tweet-eraser did not come up on $PORT" >&2
+exit 1

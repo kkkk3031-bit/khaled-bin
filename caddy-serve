@@ -1,0 +1,25 @@
+#!/bin/bash
+# Starts Caddy (auto-HTTPS reverse proxy for tweet-eraser) if it isn't already
+# listening. Mirrors twdl-serve's ensure/restart pattern.
+set -u
+APP=$HOME/tweet-eraser
+LOG=$HOME/.cache/caddy.log
+mkdir -p "$HOME/.cache"
+
+listening() { ss -ltn 'sport = :443' 2>/dev/null | grep -q LISTEN; }
+
+if [ "${1:-ensure}" = "ensure" ] && listening; then
+  exit 0
+fi
+
+pkill -f "caddy run" 2>/dev/null
+sleep 1
+cd "$APP" || exit 1
+setsid nohup "$HOME/bin/caddy" run --config Caddyfile >> "$LOG" 2>&1 < /dev/null &
+
+for _ in $(seq 20); do
+  listening && { echo "caddy up on 443"; exit 0; }
+  sleep 0.5
+done
+echo "caddy did not come up on 443" >&2
+exit 1

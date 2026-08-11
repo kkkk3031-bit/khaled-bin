@@ -8,10 +8,10 @@ KEYS="$HOME/.config/ai-council/keys.env"
 save=0; [ "${1:-}" = "--save" ] && { save=1; shift; }
 q="$*"; [ -z "$q" ] && { echo 'usage: council [--save] "question"'; exit 2; }
 
-declare -A KEYMAP=( [gemini]="${GEMINI_API_KEY:-}" [openai]="${OPENAI_API_KEY:-}" [deepseek]="${DEEPSEEK_API_KEY:-}" [kimi]="${MOONSHOT_API_KEY:-}" [minimax]="${MINIMAX_API_KEY:-}" )
+declare -A KEYMAP=( [gemini]="${GEMINI_API_KEY:-}" [openai]="${OPENAI_API_KEY:-}" [deepseek]="${DEEPSEEK_API_KEY:-}" [kimi]="${MOONSHOT_API_KEY:-}" [minimax]="${MINIMAX_API_KEY:-}" [grok]="${XAI_API_KEY:-}" )
 out="# Council: $q\n\n_$(date -u +'%F %H:%M UTC')_\n"
 any=0
-for a in gemini openai deepseek kimi minimax; do
+for a in gemini openai deepseek kimi minimax grok; do
   [ -z "${KEYMAP[$a]}" ] && continue
   any=1
   echo "── $a ──"

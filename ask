@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ask <agent> "<prompt>"  — send a prompt to one AI, print its reply.
-# Agents: gemini | codex | openai | deepseek | kimi | minimax
+# Agents: gemini | codex | openai | deepseek | kimi | minimax | grok
 # Keys come from ~/.config/ai-council/keys.env. All use OpenAI-compatible chat.
 set -uo pipefail
 KEYS="$HOME/.config/ai-council/keys.env"
@@ -8,7 +8,7 @@ KEYS="$HOME/.config/ai-council/keys.env"
 
 agent="${1:-}"; shift || true
 prompt="$*"
-[ -z "$agent" ] || [ -z "$prompt" ] && { echo "usage: ask <gemini|codex|openai|deepseek|kimi|minimax> \"prompt\""; exit 2; }
+[ -z "$agent" ] || [ -z "$prompt" ] && { echo "usage: ask <gemini|codex|openai|deepseek|kimi|minimax|grok> \"prompt\""; exit 2; }
 
 case "$agent" in
   gemini)   base="https://generativelanguage.googleapis.com/v1beta/openai"; key="${GEMINI_API_KEY:-}";   model="${GEMINI_MODEL:-gemini-3.6-flash}";;
@@ -16,6 +16,7 @@ case "$agent" in
   deepseek) base="https://api.deepseek.com";     key="${DEEPSEEK_API_KEY:-}"; model="${DEEPSEEK_MODEL:-deepseek-chat}";;
   kimi)     base="https://api.moonshot.ai/v1";    key="${MOONSHOT_API_KEY:-}"; model="${MOONSHOT_MODEL:-kimi-k2-0711-preview}";;
   minimax)  base="https://api.minimax.chat/v1";   key="${MINIMAX_API_KEY:-}";  model="${MINIMAX_MODEL:-abab6.5s-chat}";;
+  grok)     base="https://api.x.ai/v1";           key="${XAI_API_KEY:-}";      model="${GROK_MODEL:-grok-4.5}";;
   *) echo "unknown agent: $agent"; exit 2;;
 esac
 
