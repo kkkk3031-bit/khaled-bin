@@ -1,24 +1,23 @@
-#!/usr/bin/env python3
+#!/home/khaled/discord-backup-bot/.venv/bin/python3
 """BackUpBot auto-test: trigger a real backup via the admin API, watch the bot
 logs until it finishes, then verify the /latest download link serves a file.
 
-Cron-safe (absolute railway path, secrets pulled live, never stored).
+Cron-safe. Secrets read from the local .env (self-hosted on this VPS since
+Railway hit its billing usage limit on 2026-08-13), never stored in this file.
 Log: ~/.cache/backupbot-autotest.log
 """
 import hashlib
 import hmac
 import json
 import os
-import subprocess
 import sys
 import time
 import urllib.request
 
-BASE = "https://backup-bot-production.up.railway.app"
+BASE = "https://backupbot.72-60-89-132.sslip.io"
 GUILD = "1461292328252739768"  # Khaled's guild (watchdog template guild)
 LINKED_DIR = os.path.expanduser("~/discord-backup-bot")
 LOG = os.path.expanduser("~/.cache/backupbot-autotest.log")
-RAILWAY = os.path.expanduser("~/.railway/bin/railway")
 UA = {"User-Agent": "backupbot-autotest/1.0"}
 
 
@@ -37,9 +36,8 @@ def http(method, url, timeout=30):
 
 
 def main():
-    out = subprocess.run([RAILWAY, "variables", "--json"], cwd=LINKED_DIR,
-                         capture_output=True, text=True, timeout=60)
-    v = json.loads(out.stdout)
+    from dotenv import dotenv_values
+    v = dotenv_values(os.path.join(LINKED_DIR, ".env"))
     admin = (v.get("ADMIN_SECRET")
              or hashlib.sha256(("admin:" + v["DOWNLOAD_SECRET"]).encode()).hexdigest()[:32])
     dl_token = hmac.new(v["DOWNLOAD_SECRET"].encode(), GUILD.encode(),

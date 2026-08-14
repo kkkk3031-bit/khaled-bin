@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/khaled/discord-backup-bot/.venv/bin/python3
 """backupbot-cmdcheck — hourly watchdog for the Discord backup bot's slash commands.
 
 Checks EVERY guild the bot is in against a template guild's command set; any
@@ -7,12 +7,13 @@ guild missing commands (like KhaledQ8 1461292328252739768 which drifted to just
 Also keeps the GLOBAL command list empty (per-guild registration is the design;
 a stray global 'run' was found and wiped 2026-07-06).
 
-Token comes from Railway env (project discord-backup-bot) via the linked clone
-at ~/discord-backup-bot — never stored in this file.
+Token comes from the local .env (project self-hosted on this VPS since Railway
+hit its billing usage limit on 2026-08-13) at ~/discord-backup-bot/.env —
+never stored in this file.
 Log: ~/.cache/backupbot-cmdcheck.log
 """
 import json
-import os, subprocess, sys, time, urllib.request, urllib.error
+import os, sys, time, urllib.request, urllib.error
 
 LINKED_DIR = os.path.expanduser("~/discord-backup-bot")
 TEMPLATE_GUILD = "1461292328252739768"          # KhaledQ8 — owner's server, kept full
@@ -26,13 +27,12 @@ def log(msg):
     with open(LOG, "a") as fh:
         fh.write(line + "\n")
 
-def railway_vars():
-    out = subprocess.run([os.path.expanduser("~/.railway/bin/railway"), "variables", "--json"], cwd=LINKED_DIR,
-                         capture_output=True, text=True, timeout=60)
-    return json.loads(out.stdout)
+def local_vars():
+    from dotenv import dotenv_values
+    return dotenv_values(os.path.join(LINKED_DIR, ".env"))
 
 def main():
-    v = railway_vars()
+    v = local_vars()
     tok, app = v["DISCORD_TOKEN"], v["APPLICATION_ID"]
     H = {"Authorization": f"Bot {tok}", "Content-Type": "application/json",
          "User-Agent": "DiscordBot (https://discordbackupbot.vercel.app, 1.0)"}
