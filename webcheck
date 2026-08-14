@@ -46,11 +46,14 @@ refresh_vercel() {
 if [ "${1:-}" = "--refresh" ] || [ ! -s "$CACHE/railway.txt" ]; then refresh_railway; fi
 if [ "${1:-}" = "--refresh" ] || [ ! -s "$CACHE/vercel.txt" ]; then refresh_vercel; fi
 
+# Domains to never test/report (retired/abandoned apps) — one per line, `#` comments OK.
+touch "$CACHE/ignore.txt"
+
 echo "Testing all URLs..."
 {
   sed 's/^/railway\t/' "$CACHE/railway.txt"
   sed 's/^/vercel\t/'  "$CACHE/vercel.txt"
-} | while IFS=$'\t' read -r plat name dom; do
+} | grep -vFf <(grep -v '^#' "$CACHE/ignore.txt") | while IFS=$'\t' read -r plat name dom; do
   [ -z "$dom" ] && continue
   echo "$plat|$name|$dom"
 done | xargs -P 30 -I{} bash -c '
