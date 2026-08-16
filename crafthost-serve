@@ -1,0 +1,38 @@
+#!/bin/bash
+# The one way to start crafthost (self-hosted on the VPS since Railway hit
+# its billing usage limit and stopped provisioning). Mirrors backupbot-serve:
+# lock, health-check first, only restart if actually asked.
+set -u
+
+APP=$HOME/crafthost
+PORT=4430
+LOG=$APP/crafthost.log
+LOCK=$HOME/.cache/crafthost-serve.lock
+
+exec 9>"$LOCK"
+flock -w 60 9 || { echo "another crafthost-serve is running — skipped"; exit 0; }
+
+healthy()   { curl -fs -o /dev/null -m 10 "http://localhost:$PORT/"; }
+listening() { ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; }
+
+if [ "${1:-ensure}" = "ensure" ] && healthy; then
+  exit 0
+fi
+
+fuser -k "$PORT/tcp" >/dev/null 2>&1
+pkill -f "node $APP/backend/server.js" >/dev/null 2>&1
+for _ in $(seq 30); do listening || break; sleep 0.5; done
+if listening; then
+  echo "port $PORT still held after 15s — not starting a second instance" >&2
+  exit 1
+fi
+
+cd "$APP" || exit 1
+setsid nohup node backend/server.js >> "$LOG" 2>&1 < /dev/null 9>&- &
+
+for _ in $(seq 60); do
+  healthy && { echo "crafthost up on $PORT"; exit 0; }
+  sleep 1
+done
+echo "crafthost did not come up on $PORT" >&2
+exit 1
