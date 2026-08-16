@@ -3,6 +3,8 @@
 # ~/vault/Tasks/inbox.md per run, writes the result back, saves durable
 # knowledge into Wiki/, logs, and syncs. Kill switch: ~/vault/.no-agent
 set -uo pipefail
+# cron's PATH has neither claude (~/.local/bin) nor vercel/git-lfs etc (~/bin)
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/bin:$PATH"
 VAULT="$HOME/vault"; INBOX="$VAULT/Tasks/inbox.md"; LOG="$VAULT/Logs/agent-log.md"
 [ -f "$VAULT/.no-agent" ] && exit 0
 [ -f "$INBOX" ] || exit 0
@@ -21,6 +23,15 @@ If the task produces durable knowledge, ALSO save a clean note under $VAULT/Wiki
 You may consult other AIs with: ask <gemini|deepseek|kimi|openai> \"...\"  or  council \"...\".
 Do NOT deploy unless the task explicitly says deploy. End with a 3-5 line markdown summary of what you did."
     res=$(cd "$HOME" && timeout 1800 claude -p --dangerously-skip-permissions "$prompt" 2>&1) || res="(error/timeout) $res"
+    # "failed to run command" means `timeout` itself couldn't exec claude (OS-level
+    # EACCES/ENOEXEC, e.g. mid self-update) — not a real task failure. One retry
+    # clears it; seen recur for days straight when left unretried (2026-08-16 incident).
+    if [[ "$res" == *"failed to run command"* ]]; then
+      log_exec_fail=$(date -u +'%F %H:%M UTC')
+      echo "[$log_exec_fail] exec-level failure invoking claude, retrying once: $res" >> "$LOG"
+      sleep 5
+      res=$(cd "$HOME" && timeout 1800 claude -p --dangerously-skip-permissions "$prompt" 2>&1) || res="(error/timeout) $res"
+    fi
     block=$(printf '%s' "$res" | sed 's/^/'"$indent"'  > /')
     L[$i]="${indent}- [x] !claude ${task}  ✓ ${ts}"$'\n'"${indent}  > **Claude (${ts}):**"$'\n'"${block}"
     changed=1; break

@@ -88,14 +88,51 @@ main(){
     esac
   done <<< "$out"
 
-  # 2-strike escalation: only shout if broken twice in a row
+  # 2-strike escalation: only shout if broken twice in a row, and only once
+  # per 24h *per server* (e.g. sentry needing OAuth reauth is a standing,
+  # non-autofixable condition — re-queuing an inbox task for it forever is
+  # spam, not a repair). Dedup is keyed per-server-name, not a hash of the
+  # whole broken-set snapshot: hashing the snapshot meant any transient flake
+  # of an unrelated server (npx cold start, network blip, shadcn's
+  # "Pending approval" flap) changed the hash and defeated the 24h window,
+  # re-escalating the same standing sentry issue on nearly every 30min cron
+  # run for hours — 135 duplicate vault inbox tasks, each spawning a full
+  # headless Claude agent (2026-08-16 incident).
   local prev=0; [ -f "$STATE" ] && prev=$(cat "$STATE")
   echo "$bad" > "$STATE"
   if [ "$bad" = 1 ] && [ "$prev" = 1 ]; then
-    log "ESCALATE: MCP servers broken 2 runs in a row"
-    if [ -f ~/vault/Tasks/inbox.md ]; then
-      echo "- [ ] !claude MCP server(s) still failing after auto-fix — check ~/.cache/mcpfix.log, diagnose and repair" >> ~/vault/Tasks/inbox.md
-      log "escalation queued in vault inbox"
+    local esc_file=~/.cache/mcpfix.escalated.json
+    local new_names
+    new_names=$(echo "$out" | python3 -c "
+import json, sys, time
+now = int(time.time())
+state_file = '$esc_file'
+try:
+    state = json.load(open(state_file))
+except Exception:
+    state = {}
+broken = []
+for line in sys.stdin:
+    line = line.rstrip('\n')
+    if not line.strip() or 'Connected' in line:
+        continue
+    key = line.split(' - ')[0].strip()
+    broken.append(key)
+new = [k for k in broken if now - state.get(k, 0) > 86400]
+for k in broken:
+    state[k] = now
+json.dump(state, open(state_file, 'w'))
+print('\n'.join(new))
+")
+    if [ -n "$new_names" ]; then
+      log "ESCALATE: MCP servers broken 2 runs in a row: $(echo "$new_names" | tr '\n' ';')"
+      if [ -f ~/vault/Tasks/inbox.md ]; then
+        names_csv=$(echo "$new_names" | tr '\n' ',' | sed 's/,$//')
+        echo "- [ ] !claude MCP server(s) still failing after auto-fix ($names_csv) — check ~/.cache/mcpfix.log, diagnose and repair" >> ~/vault/Tasks/inbox.md
+        log "escalation queued in vault inbox"
+      fi
+    else
+      log "ESCALATE: suppressed (all currently-broken servers already escalated within last 24h)"
     fi
   fi
   return 0
