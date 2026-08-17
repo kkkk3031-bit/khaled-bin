@@ -1,0 +1,38 @@
+#!/bin/bash
+# Starts the 3d-site Next.js app (port 4440) if it isn't already answering.
+set -u
+APP=$HOME/3d-site
+PORT=4440
+LOG=$APP/server.log
+LOCK=$HOME/.cache/3dsite-serve.lock
+mkdir -p "$HOME/.cache"
+
+exec 9>"$LOCK"
+flock -w 60 9 || { echo "another 3dsite-serve is running — skipped"; exit 0; }
+
+healthy()   { curl -fs -o /dev/null -m 10 "http://localhost:$PORT/"; }
+listening() { ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; }
+
+if [ "${1:-ensure}" = "ensure" ] && healthy; then
+  exit 0
+fi
+
+fuser -k "$PORT/tcp" >/dev/null 2>&1
+for _ in $(seq 30); do listening || break; sleep 0.5; done
+if listening; then
+  echo "port $PORT still held after 15s — not starting a second server" >&2
+  exit 1
+fi
+
+cd "$APP" || exit 1
+[ -d .next ] && [ -f .next/BUILD_ID ] || npm run build >> "$LOG" 2>&1
+NODE=/usr/local/bin/node
+[ -x "$NODE" ] || NODE=$(command -v node) || { echo "no node found" >&2; exit 1; }
+PORT=$PORT setsid nohup npm run start -- -p $PORT >> "$LOG" 2>&1 < /dev/null 9>&- &
+
+for _ in $(seq 40); do
+  healthy && { echo "3d-site up on $PORT"; exit 0; }
+  sleep 0.5
+done
+echo "3d-site did not come up on $PORT" >&2
+exit 1
