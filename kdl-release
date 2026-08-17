@@ -46,6 +46,10 @@ esac
 # A build takes ~15 min (emulator has no KVM). Never start a second one on top.
 exec 9>"$LOCK"
 flock -n 9 || { log "another release is still running — skipped"; exit 0; }
+# Tell emu-test.sh (called via build.sh below) it doesn't need to take this
+# same lock itself — we already hold it, and a child re-locking the same path
+# on its own fd would just wait forever on its own ancestor. See emu-test.sh.
+export KDL_RELEASE_LOCKED=1
 
 NOW=$(srchash)
 if [ "$FORCE" = 0 ] && [ "$NOW" = "$(cat "$HASHFILE" 2>/dev/null)" ]; then
