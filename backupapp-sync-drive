@@ -1,0 +1,22 @@
+#!/bin/bash
+# Mirrors ~/backup-app/server/data (what phones have uploaded to the VPS)
+# into Google Drive under BackupApp/, so backups survive off the VPS too.
+# Cron-driven, see crontab. Safe to run concurrently-guarded via flock.
+set -u
+
+SRC=$HOME/backup-app/server/data
+LOG=$HOME/backup-app/server/drive-sync.log
+LOCK=$HOME/.cache/backupapp-sync-drive.lock
+
+exec 9>"$LOCK"
+flock -n 9 || { echo "$(date -Is) another sync already running — skipped" >> "$LOG"; exit 0; }
+
+[ -d "$SRC" ] || exit 0
+
+echo "$(date -Is) sync start" >> "$LOG"
+rclone sync "$SRC" gdrive:BackupApp \
+  --create-empty-src-dirs \
+  --transfers 4 \
+  --checkers 4 \
+  --log-file "$LOG" --log-level INFO
+echo "$(date -Is) sync done" >> "$LOG"

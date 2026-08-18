@@ -1,0 +1,36 @@
+#!/bin/bash
+# The one way to start the Backup App server (APK download + upload receiver, port 4425).
+# Mirrors apkweb-serve/backupbot-serve: lock, health-check first, only restart if needed.
+set -u
+
+APP=$HOME/backup-app/server
+PORT=${PORT:-4425}
+LOG=$APP/server.log
+LOCK=$HOME/.cache/backupapp-serve.lock
+
+exec 9>"$LOCK"
+flock -w 60 9 || { echo "another backupapp-serve is running — skipped"; exit 0; }
+
+healthy()   { curl -fs -o /dev/null -m 10 "http://localhost:$PORT/api/devices"; }
+listening() { ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; }
+
+if [ "${1:-ensure}" = "ensure" ] && healthy; then
+  exit 0
+fi
+
+fuser -k "$PORT/tcp" >/dev/null 2>&1
+for _ in $(seq 30); do listening || break; sleep 0.5; done
+if listening; then
+  echo "port $PORT still held after 15s — not starting a second server" >&2
+  exit 1
+fi
+
+cd "$APP" || exit 1
+setsid nohup node server.js >> "$LOG" 2>&1 < /dev/null 9>&- &
+
+for _ in $(seq 40); do
+  healthy && { echo "backup-app up on $PORT"; exit 0; }
+  sleep 0.5
+done
+echo "backup-app did not come up on $PORT" >&2
+exit 1
