@@ -1,0 +1,39 @@
+#!/bin/bash
+# Self-hosted tweetget (X/Twitter video downloader), since Railway hit its
+# account-wide billing hard limit and stopped provisioning (2026-08-19, see
+# vault memory project_tweetget.md — 7 same-day confirmations, zero user action).
+# Mirrors backupbot-serve: lock, health-check first, only restart if actually asked.
+set -u
+
+APP=$HOME/tweetget
+PORT=4426
+LOG=$APP/tweetget.log
+LOCK=$HOME/.cache/tweetget-serve.lock
+
+exec 9>"$LOCK"
+flock -w 60 9 || { echo "another tweetget-serve is running — skipped"; exit 0; }
+
+healthy()   { curl -fs -o /dev/null -m 10 "http://localhost:$PORT/"; }
+listening() { ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; }
+
+if [ "${1:-ensure}" = "ensure" ] && healthy; then
+  exit 0
+fi
+
+fuser -k "$PORT/tcp" >/dev/null 2>&1
+pkill -f "$APP/.venv/bin/gunicorn app:app" >/dev/null 2>&1
+for _ in $(seq 30); do listening || break; sleep 0.5; done
+if listening; then
+  echo "port $PORT still held after 15s — not starting a second instance" >&2
+  exit 1
+fi
+
+cd "$APP" || exit 1
+PORT=$PORT setsid nohup .venv/bin/gunicorn app:app --workers 2 --bind 0.0.0.0:$PORT --timeout 180 >> "$LOG" 2>&1 < /dev/null 9>&- &
+
+for _ in $(seq 60); do
+  healthy && { echo "tweetget up on $PORT"; exit 0; }
+  sleep 1
+done
+echo "tweetget did not come up on $PORT" >&2
+exit 1
