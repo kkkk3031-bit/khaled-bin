@@ -7,11 +7,21 @@ APP=$HOME/backup-app/server
 PORT=${PORT:-4425}
 LOG=$APP/server.log
 LOCK=$HOME/.cache/backupapp-serve.lock
+KEYFILE=$HOME/.config/backupapp/key.env
 
 exec 9>"$LOCK"
 flock -w 60 9 || { echo "another backupapp-serve is running — skipped"; exit 0; }
 
-healthy()   { curl -fs -o /dev/null -m 10 "http://localhost:$PORT/api/devices"; }
+if [ -f "$KEYFILE" ]; then
+  set -a; source "$KEYFILE"; set +a
+else
+  echo "missing $KEYFILE — server requires BACKUP_APP_KEY to start" >&2
+  exit 1
+fi
+
+# /api/version needs no key and always answers when the server is up, so
+# it doubles as the liveness check without depending on BACKUP_APP_KEY.
+healthy()   { curl -fs -o /dev/null -m 10 "http://localhost:$PORT/api/version"; }
 listening() { ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; }
 
 if [ "${1:-ensure}" = "ensure" ] && healthy; then
