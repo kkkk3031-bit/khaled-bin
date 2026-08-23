@@ -1,7 +1,15 @@
 #!/bin/bash
-# Mirrors ~/backup-app/server/data (what phones have uploaded to the VPS)
-# into Google Drive under BackupApp/, so backups survive off the VPS too.
-# Cron-driven, see crontab. Safe to run concurrently-guarded via flock.
+# Moves ~/backup-app/server/data (what phones have uploaded to the VPS)
+# into Google Drive under BackupApp/, so Drive is the sole long-term copy -
+# the VPS disk (already 93% full elsewhere on this box) is only a brief
+# relay, not permanent storage. Cron-driven, see crontab. Safe to run
+# concurrently-guarded via flock.
+#
+# .manifest.json per device is excluded from the move (copied instead, kept
+# locally) because the server reads/writes it directly on every upload for
+# the skip-unchanged-files logic - deleting it out from under the server
+# would break resume support, and it's tiny so leaving it on disk costs
+# nothing.
 set -u
 
 SRC=$HOME/backup-app/server/data
@@ -14,9 +22,14 @@ flock -n 9 || { echo "$(date -Is) another sync already running — skipped" >> "
 [ -d "$SRC" ] || exit 0
 
 echo "$(date -Is) sync start" >> "$LOG"
-rclone sync "$SRC" gdrive:BackupApp \
+rclone copy "$SRC" gdrive:BackupApp \
+  --include "*.manifest.json" \
+  --transfers 4 --checkers 4 \
+  --log-file "$LOG" --log-level INFO
+rclone move "$SRC" gdrive:BackupApp \
+  --exclude "*.manifest.json" \
   --create-empty-src-dirs \
-  --transfers 4 \
-  --checkers 4 \
+  --delete-empty-src-dirs \
+  --transfers 4 --checkers 4 \
   --log-file "$LOG" --log-level INFO
 echo "$(date -Is) sync done" >> "$LOG"
